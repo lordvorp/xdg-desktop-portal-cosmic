@@ -1,0 +1,2478 @@
+From 95ab919be84778351d9c2607a17bf9eb4ac40a48 Mon Sep 17 00:00:00 2001
+From: Rob Bloodgood <rob@exitexchange.com>
+Date: Wed, 7 Oct 2026 09:58:53 -0700
+Subject: [portal-cosmic PATCH 1/2] feat: InputCapture portal and Clipboard via
+ ext-data-control
+
+Wire org.freedesktop.impl.portal.InputCapture to cosmic-comp, and add a
+Clipboard backend (KDE-shaped ext-data-control client) so Deskflow can
+sync the Ctrl+C/V clipboard across machines on COSMIC Wayland.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ Cargo.toml                            |    6 +-
+ data/cosmic.portal                    |    2 +-
+ i18n/en/xdg_desktop_portal_cosmic.ftl |    3 +
+ src/access.rs                         |  110 ++-
+ src/app.rs                            |    1 +
+ src/clipboard.rs                      |  951 +++++++++++++++++++++
+ src/input_capture.rs                  | 1097 +++++++++++++++++++++++++
+ src/main.rs                           |   10 +
+ src/remote_desktop.rs                 |    5 +
+ src/screencast.rs                     |    7 +
+ src/subscription.rs                   |   40 +
+ 11 files changed, 2212 insertions(+), 20 deletions(-)
+ create mode 100644 src/clipboard.rs
+ create mode 100644 src/input_capture.rs
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 67cd626..ca172c5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -32,11 +32,11 @@ pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", featur
+ ] }
+ png = "0.18"
+ reis = { version = "0.7", features = ["tokio"] }
+-rustix = { version = "1.1", features = ["fs", "time"] }
++rustix = { version = "1.1", features = ["event", "fs", "pipe", "time"] }
+ # spa_sys = { package = "libspa-sys", git = "https://github.com/pop-os/pipewire-rs" }
+ zbus = { version = "5.15.0", default-features = false, features = ["tokio"] }
+ gbm = "0.18.0"
+-wayland-protocols = "0.32.12"
++wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
+ dirs = "6.0.0"
+ jiff = "0.2"
+ url = "2.5"
+@@ -53,7 +53,7 @@ serde.workspace = true
+ spa_sys = { package = "libspa-sys", git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs" }
+ pipewire-sys = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs" }
+ tempfile = "3.27.0"
+-tokio = { version = "1.52.1", features = ["macros", "net", "rt", "sync"] }
++tokio = { version = "1.52.1", features = ["macros", "net", "rt", "sync", "time"] }
+ wayland-client = { version = "0.31.14" }
+ tracing = "0.1.44"
+ tracing-journald = { version = "0.3.2", optional = true }
+diff --git a/data/cosmic.portal b/data/cosmic.portal
+index 123564c..637e08a 100644
+--- a/data/cosmic.portal
++++ b/data/cosmic.portal
+@@ -1,4 +1,4 @@
+ [portal]
+ DBusName=org.freedesktop.impl.portal.desktop.cosmic
+-Interfaces=org.freedesktop.impl.portal.Access;org.freedesktop.impl.portal.FileChooser;org.freedesktop.impl.portal.RemoteDesktop;org.freedesktop.impl.portal.Screenshot;org.freedesktop.impl.portal.Settings;org.freedesktop.impl.portal.ScreenCast
++Interfaces=org.freedesktop.impl.portal.Access;org.freedesktop.impl.portal.FileChooser;org.freedesktop.impl.portal.RemoteDesktop;org.freedesktop.impl.portal.Screenshot;org.freedesktop.impl.portal.Settings;org.freedesktop.impl.portal.ScreenCast;org.freedesktop.impl.portal.InputCapture;org.freedesktop.impl.portal.Clipboard
+ UseIn=COSMIC
+diff --git a/i18n/en/xdg_desktop_portal_cosmic.ftl b/i18n/en/xdg_desktop_portal_cosmic.ftl
+index 7d4d2a7..a7be891 100644
+--- a/i18n/en/xdg_desktop_portal_cosmic.ftl
++++ b/i18n/en/xdg_desktop_portal_cosmic.ftl
+@@ -2,6 +2,9 @@ allow = Allow
+ allow-once = Allow once
+ always-allow = Always allow
+ deny = Deny
++input-capture = Input capture
++input-capture-request = Allow keyboard and pointer capture?
++input-capture-description = "{$app_name}" wants to use your keyboard and mouse on another computer.
+ cancel = Cancel
+ capture = Capture
+ share = Share
+diff --git a/src/access.rs b/src/access.rs
+index 94fac33..ca37157 100644
+--- a/src/access.rs
++++ b/src/access.rs
+@@ -36,6 +36,14 @@ pub(crate) struct AccessDialogOptions {
+ #[zvariant(signature = "a{sv}")]
+ pub struct AccessDialogResult {
+     choices: Vec<(String, String)>,
++    pub(crate) always_allow: bool,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum ConfirmationResult {
++    Allow,
++    AlwaysAllow,
++    Deny,
+ }
+ 
+ pub struct Access {
+@@ -96,6 +104,7 @@ impl Access {
+                 choice_labels,
+                 tx,
+                 access_id: window::Id::NONE,
++                always_allow: false,
+             }))
+             .await
+         {
+@@ -109,9 +118,65 @@ impl Access {
+     }
+ }
+ 
++/// Ask the user for a simple allow/deny decision through the existing portal
++/// access dialog. InputCapture and the other privileged portal interfaces use
++/// the same COSMIC UI so that permission prompts have one consistent owner.
++pub(crate) async fn show_confirmation(
++    tx: &Sender<subscription::Event>,
++    handle: zvariant::ObjectPath<'static>,
++    app_id: &str,
++    parent_window: &str,
++    labels: ConfirmationLabels,
++) -> ConfirmationResult {
++    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel(1);
++    let options = AccessDialogOptions {
++        modal: Some(true),
++        deny_label: Some(labels.deny),
++        grant_label: Some(labels.grant),
++        icon: Some(labels.icon),
++        choices: None,
++    };
++    let args = AccessDialogArgs {
++        handle,
++        app_id: app_id.to_string(),
++        parent_window: parent_window.to_string(),
++        title: labels.title,
++        subtitle: labels.subtitle,
++        body: labels.body,
++        options,
++        active_choices: HashMap::new(),
++        choice_labels: Vec::new(),
++        tx: response_tx,
++        access_id: window::Id::NONE,
++        always_allow: labels.always_allow,
++    };
++    if let Err(err) = tx.send(subscription::Event::Access(args)).await {
++        tracing::error!("Failed to send access confirmation dialog, {err}");
++        return ConfirmationResult::Deny;
++    }
++    match response_rx.recv().await {
++        Some(PortalResponse::Success(result)) if result.always_allow => {
++            ConfirmationResult::AlwaysAllow
++        }
++        Some(PortalResponse::Success(_)) => ConfirmationResult::Allow,
++        _ => ConfirmationResult::Deny,
++    }
++}
++
++pub(crate) struct ConfirmationLabels {
++    pub(crate) title: String,
++    pub(crate) subtitle: String,
++    pub(crate) body: String,
++    pub(crate) grant: String,
++    pub(crate) deny: String,
++    pub(crate) icon: String,
++    pub(crate) always_allow: bool,
++}
++
+ #[derive(Debug, Clone)]
+ pub enum Msg {
+     Allow,
++    AlwaysAllow,
+     Cancel,
+     Choice(usize, usize),
+ }
+@@ -129,6 +194,7 @@ pub(crate) struct AccessDialogArgs {
+     pub choice_labels: Vec<Vec<String>>,
+     pub tx: Sender<PortalResponse<AccessDialogResult>>,
+     pub access_id: window::Id,
++    pub always_allow: bool,
+ }
+ 
+ impl AccessDialogArgs {
+@@ -229,20 +295,28 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
+     .on_press(Msg::Allow)
+     .class(cosmic::theme::Button::Suggested);
+ 
+-    let content = KeyboardWrapper::new(
+-        widget::dialog()
+-            .title(&args.title)
+-            .body(&args.subtitle)
+-            .control(control)
+-            .icon(icon)
+-            .secondary_action(cancel_button)
+-            .primary_action(allow_button),
+-        |key, _| match key {
+-            Key::Named(Named::Enter) => Some(Msg::Allow),
+-            Key::Named(Named::Escape) => Some(Msg::Cancel),
+-            _ => None,
+-        },
+-    );
++    let always_allow_button = args
++        .always_allow
++        .then(|| button::text(fl!("always-allow")).on_press(Msg::AlwaysAllow));
++
++    let dialog = widget::dialog()
++        .title(&args.title)
++        .body(&args.subtitle)
++        .control(control)
++        .icon(icon)
++        .secondary_action(cancel_button)
++        .primary_action(allow_button);
++    let dialog = if let Some(button) = always_allow_button {
++        dialog.tertiary_action(button)
++    } else {
++        dialog
++    };
++
++    let content = KeyboardWrapper::new(dialog, |key, _| match key {
++        Key::Named(Named::Enter) => Some(Msg::Allow),
++        Key::Named(Named::Escape) => Some(Msg::Cancel),
++        _ => None,
++    });
+ 
+     autosize(content, Id::new(args.app_id.clone()))
+         .min_width(1.)
+@@ -255,14 +329,18 @@ pub fn update_msg(
+     msg: Msg,
+ ) -> cosmic::Task<cosmic::Action<crate::app::Msg>> {
+     match msg {
+-        Msg::Allow => {
++        Msg::Allow | Msg::AlwaysAllow => {
++            let always_allow = matches!(&msg, Msg::AlwaysAllow);
+             let args = portal.access_args.take().unwrap();
+             let tx = args.tx.clone();
+             let choices = args.active_choices.clone().into_iter().collect();
+             cosmic::Task::batch([
+                 cosmic::task::future::<(), ()>(async move {
+                     _ = tx
+-                        .send(PortalResponse::Success(AccessDialogResult { choices }))
++                        .send(PortalResponse::Success(AccessDialogResult {
++                            choices,
++                            always_allow,
++                        }))
+                         .await;
+                 })
+                 .discard(),
+diff --git a/src/app.rs b/src/app.rs
+index 2a2fb6d..f383481 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -187,6 +187,7 @@ impl cosmic::Application for CosmicPortal {
+                 subscription::Event::CancelRemoteDesktop(handle) => {
+                     remote_desktop_dialog::cancel(self, handle).map(cosmic::Action::App)
+                 }
++                subscription::Event::InputCapture(_) => cosmic::iced::Task::none(),
+                 subscription::Event::Config(config) => self.update(Msg::ConfigSubUpdate(config)),
+                 subscription::Event::Accent(_)
+                 | subscription::Event::IsDark(_)
+diff --git a/src/clipboard.rs b/src/clipboard.rs
+new file mode 100644
+index 0000000..92673de
+--- /dev/null
++++ b/src/clipboard.rs
+@@ -0,0 +1,951 @@
++//! `org.freedesktop.impl.portal.Clipboard`
++//!
++//! The portal is an `ext-data-control-v1` client, the same role KDE's backend
++//! plays. `RequestClipboard` grants a session, `SelectionRead` pipes
++//! `offer.receive`, and `SetSelection` creates a data source whose `send`
++//! events become `SelectionTransfer`. One object serves InputCapture and
++//! RemoteDesktop.
++
++use std::collections::HashMap;
++use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::mpsc::{self, Receiver, Sender};
++use std::sync::{Arc, Mutex, OnceLock};
++use std::thread;
++use std::time::Duration;
++
++use tokio::sync::mpsc::UnboundedReceiver;
++use tokio::sync::oneshot;
++use wayland_client::globals::{GlobalListContents, registry_queue_init};
++use wayland_client::protocol::{wl_registry, wl_seat::WlSeat};
++use wayland_client::{
++    Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle, event_created_child,
++};
++use wayland_protocols::ext::data_control::v1::client::{
++    ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
++    ext_data_control_manager_v1::ExtDataControlManagerV1,
++    ext_data_control_offer_v1::{self, ExtDataControlOfferV1},
++    ext_data_control_source_v1::{self, ExtDataControlSourceV1},
++};
++use zbus::message::Header;
++use zbus::object_server::SignalEmitter;
++use zbus::zvariant::{self, OwnedValue};
++
++use crate::input_capture::{InputCaptureData, called_by_portal_frontend};
++use crate::screencast::SessionData;
++use crate::{DBUS_PATH, session_interface};
++
++const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
++
++struct Snapshot {
++    mimes: Vec<String>,
++    owner: Option<String>,
++}
++
++enum Cmd {
++    Grant {
++        path: String,
++    },
++    DropSession {
++        path: String,
++    },
++    SetSelection {
++        session: String,
++        mimes: Vec<String>,
++        reply: oneshot::Sender<Result<(), String>>,
++    },
++    Read {
++        mime: String,
++        reply: oneshot::Sender<Result<OwnedFd, String>>,
++    },
++    Write {
++        serial: u32,
++        reply: oneshot::Sender<Result<OwnedFd, String>>,
++    },
++    WriteDone {
++        serial: u32,
++    },
++    Snapshot {
++        reply: oneshot::Sender<Snapshot>,
++    },
++}
++
++enum ClipEvent {
++    Owner {
++        sessions: Vec<String>,
++        mimes: Vec<String>,
++        owner: Option<String>,
++    },
++    Transfer {
++        session: String,
++        mime: String,
++        serial: u32,
++    },
++}
++
++struct Backend {
++    cmd_tx: Sender<Cmd>,
++    wake: OwnedFd,
++    available: Arc<AtomicBool>,
++    events: Mutex<Option<UnboundedReceiver<ClipEvent>>>,
++}
++
++impl Backend {
++    fn send(&self, cmd: Cmd) -> bool {
++        if self.cmd_tx.send(cmd).is_err() {
++            return false;
++        }
++        let _ = rustix::io::write(&self.wake, &[1]);
++        true
++    }
++}
++
++static BACKEND: OnceLock<Arc<Backend>> = OnceLock::new();
++
++pub(crate) fn is_available() -> bool {
++    BACKEND
++        .get()
++        .is_some_and(|backend| backend.available.load(Ordering::Acquire))
++}
++
++pub(crate) fn start() {
++    BACKEND.get_or_init(|| {
++        let (cmd_tx, cmd_rx) = mpsc::channel();
++        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
++        let (wake_read, wake_write) =
++            rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK)
++                .expect("clipboard wake pipe");
++        let available = Arc::new(AtomicBool::new(false));
++        let backend = Arc::new(Backend {
++            cmd_tx,
++            wake: wake_write,
++            available: available.clone(),
++            events: Mutex::new(Some(event_rx)),
++        });
++        thread::Builder::new()
++            .name("clipboard-wl".into())
++            .spawn(move || thread_main(cmd_rx, wake_read, event_tx, available))
++            .expect("clipboard thread");
++        backend
++    });
++}
++
++pub(crate) fn spawn_forwarder(connection: zbus::Connection) {
++    let Some(backend) = BACKEND.get() else {
++        return;
++    };
++    let Some(mut events) = backend.events.lock().unwrap().take() else {
++        return;
++    };
++    tokio::spawn(async move {
++        while let Some(event) = events.recv().await {
++            if let Err(err) = forward_event(&connection, event).await {
++                tracing::debug!("clipboard signal: {err}");
++            }
++        }
++    });
++}
++
++pub(crate) fn session_closed(path: &str) {
++    let Some(backend) = BACKEND.get() else {
++        return;
++    };
++    backend.send(Cmd::DropSession {
++        path: path.to_string(),
++    });
++}
++
++pub(crate) fn schedule_announce(connection: zbus::Connection, session: String) {
++    tokio::spawn(async move {
++        tokio::time::sleep(Duration::from_millis(300)).await;
++        announce(&connection, &session).await;
++    });
++}
++
++pub(crate) async fn announce(connection: &zbus::Connection, session: &str) {
++    let Ok(snapshot) = snapshot().await else {
++        return;
++    };
++    let is_owner = snapshot.owner.as_deref() == Some(session);
++    if let Err(err) = emit_owner(connection, session, &snapshot.mimes, is_owner).await {
++        tracing::debug!("clipboard announce {session}: {err}");
++    }
++}
++
++async fn snapshot() -> Result<Snapshot, ()> {
++    let Some(backend) = BACKEND.get() else {
++        return Err(());
++    };
++    let (tx, rx) = oneshot::channel();
++    if !backend.send(Cmd::Snapshot { reply: tx }) {
++        return Err(());
++    }
++    tokio::time::timeout(TRANSFER_TIMEOUT, rx)
++        .await
++        .ok()
++        .and_then(Result::ok)
++        .ok_or(())
++}
++
++async fn roundtrip_unit(
++    build: impl FnOnce(oneshot::Sender<Result<(), String>>) -> Cmd,
++) -> zbus::fdo::Result<()> {
++    let backend = BACKEND.get().ok_or_else(backend_stopped)?;
++    let (tx, rx) = oneshot::channel();
++    if !backend.send(build(tx)) {
++        return Err(backend_stopped());
++    }
++    match tokio::time::timeout(TRANSFER_TIMEOUT, rx).await {
++        Ok(Ok(Ok(()))) => Ok(()),
++        Ok(Ok(Err(message))) => Err(zbus::fdo::Error::Failed(message)),
++        _ => Err(backend_stopped()),
++    }
++}
++
++async fn roundtrip_fd(
++    build: impl FnOnce(oneshot::Sender<Result<OwnedFd, String>>) -> Cmd,
++) -> zbus::fdo::Result<zvariant::OwnedFd> {
++    let backend = BACKEND.get().ok_or_else(backend_stopped)?;
++    let (tx, rx) = oneshot::channel();
++    if !backend.send(build(tx)) {
++        return Err(backend_stopped());
++    }
++    match tokio::time::timeout(TRANSFER_TIMEOUT, rx).await {
++        Ok(Ok(Ok(fd))) => Ok(zvariant::OwnedFd::from(fd)),
++        Ok(Ok(Err(message))) => Err(zbus::fdo::Error::Failed(message)),
++        _ => Err(backend_stopped()),
++    }
++}
++
++fn backend_stopped() -> zbus::fdo::Error {
++    zbus::fdo::Error::Failed("clipboard backend unavailable".into())
++}
++
++pub(crate) struct Clipboard;
++
++impl Clipboard {
++    pub(crate) fn new() -> Self {
++        Self
++    }
++}
++
++#[zbus::interface(name = "org.freedesktop.impl.portal.Clipboard")]
++impl Clipboard {
++    #[zbus(name = "RequestClipboard")]
++    async fn request_clipboard(
++        &self,
++        #[zbus(connection)] connection: &zbus::Connection,
++        #[zbus(header)] header: Header<'_>,
++        session_handle: zvariant::ObjectPath<'_>,
++        _options: HashMap<String, OwnedValue>,
++    ) -> zbus::fdo::Result<()> {
++        if !called_by_portal_frontend(connection, &header).await {
++            return Err(zbus::fdo::Error::AccessDenied(
++                "Clipboard frontend required".into(),
++            ));
++        }
++        if !is_available() {
++            return Err(zbus::fdo::Error::Failed(
++                "ext-data-control is not available".into(),
++            ));
++        }
++        let path = session_handle.as_str().to_string();
++        if let Some(interface) =
++            session_interface::<InputCaptureData>(connection, &session_handle).await
++        {
++            interface.get_mut().await.clipboard_requested = true;
++        } else if let Some(interface) =
++            session_interface::<SessionData>(connection, &session_handle).await
++        {
++            let mut data = interface.get_mut().await;
++            let Some(remote) = data.remote_desktop.as_mut() else {
++                return Err(zbus::fdo::Error::InvalidArgs(
++                    "Session is not InputCapture or RemoteDesktop".into(),
++                ));
++            };
++            remote.clipboard_enabled = true;
++            remote.clipboard_session = Some(path.clone());
++        } else {
++            return Err(zbus::fdo::Error::InvalidArgs(
++                "Unknown clipboard session".into(),
++            ));
++        }
++        let Some(backend) = BACKEND.get() else {
++            return Err(backend_stopped());
++        };
++        if !backend.send(Cmd::Grant { path }) {
++            return Err(backend_stopped());
++        }
++        Ok(())
++    }
++
++    #[zbus(name = "SetSelection")]
++    async fn set_selection(
++        &self,
++        #[zbus(connection)] connection: &zbus::Connection,
++        #[zbus(header)] header: Header<'_>,
++        session_handle: zvariant::ObjectPath<'_>,
++        options: HashMap<String, OwnedValue>,
++    ) -> zbus::fdo::Result<()> {
++        require_frontend(connection, &header).await?;
++        require_enabled(connection, &session_handle).await?;
++        let session = session_handle.as_str().to_string();
++        let mimes = mime_types(&options);
++        roundtrip_unit(move |reply| Cmd::SetSelection {
++            session,
++            mimes,
++            reply,
++        })
++        .await
++    }
++
++    #[zbus(name = "SelectionWrite")]
++    async fn selection_write(
++        &self,
++        #[zbus(connection)] connection: &zbus::Connection,
++        #[zbus(header)] header: Header<'_>,
++        session_handle: zvariant::ObjectPath<'_>,
++        serial: u32,
++    ) -> zbus::fdo::Result<zvariant::OwnedFd> {
++        require_frontend(connection, &header).await?;
++        require_enabled(connection, &session_handle).await?;
++        roundtrip_fd(move |reply| Cmd::Write { serial, reply }).await
++    }
++
++    #[zbus(name = "SelectionWriteDone")]
++    async fn selection_write_done(
++        &self,
++        #[zbus(connection)] connection: &zbus::Connection,
++        #[zbus(header)] header: Header<'_>,
++        session_handle: zvariant::ObjectPath<'_>,
++        serial: u32,
++        _success: bool,
++    ) -> zbus::fdo::Result<()> {
++        require_frontend(connection, &header).await?;
++        require_enabled(connection, &session_handle).await?;
++        let Some(backend) = BACKEND.get() else {
++            return Err(backend_stopped());
++        };
++        if !backend.send(Cmd::WriteDone { serial }) {
++            return Err(backend_stopped());
++        }
++        Ok(())
++    }
++
++    #[zbus(name = "SelectionRead")]
++    async fn selection_read(
++        &self,
++        #[zbus(connection)] connection: &zbus::Connection,
++        #[zbus(header)] header: Header<'_>,
++        session_handle: zvariant::ObjectPath<'_>,
++        mime_type: String,
++    ) -> zbus::fdo::Result<zvariant::OwnedFd> {
++        require_frontend(connection, &header).await?;
++        require_enabled(connection, &session_handle).await?;
++        roundtrip_fd(move |reply| Cmd::Read {
++            mime: mime_type,
++            reply,
++        })
++        .await
++    }
++
++    #[zbus(property, name = "version")]
++    fn version(&self) -> u32 {
++        1
++    }
++
++    #[zbus(signal)]
++    async fn selection_owner_changed(
++        emitter: &SignalEmitter<'_>,
++        session_handle: &zvariant::ObjectPath<'_>,
++        options: HashMap<String, OwnedValue>,
++    ) -> zbus::Result<()>;
++
++    #[zbus(signal)]
++    async fn selection_transfer(
++        emitter: &SignalEmitter<'_>,
++        session_handle: &zvariant::ObjectPath<'_>,
++        mime_type: &str,
++        serial: u32,
++    ) -> zbus::Result<()>;
++}
++
++async fn require_frontend(
++    connection: &zbus::Connection,
++    header: &Header<'_>,
++) -> zbus::fdo::Result<()> {
++    if called_by_portal_frontend(connection, header).await {
++        Ok(())
++    } else {
++        Err(zbus::fdo::Error::AccessDenied(
++            "Clipboard frontend required".into(),
++        ))
++    }
++}
++
++async fn require_enabled(
++    connection: &zbus::Connection,
++    session_handle: &zvariant::ObjectPath<'_>,
++) -> zbus::fdo::Result<()> {
++    if let Some(interface) = session_interface::<InputCaptureData>(connection, session_handle).await
++    {
++        let data = interface.get().await;
++        if data.clipboard_requested && data.started {
++            return Ok(());
++        }
++        return Err(zbus::fdo::Error::AccessDenied(
++            "Clipboard not enabled".into(),
++        ));
++    }
++    if let Some(interface) = session_interface::<SessionData>(connection, session_handle).await {
++        let enabled = interface
++            .get()
++            .await
++            .remote_desktop
++            .as_ref()
++            .is_some_and(|remote| remote.clipboard_enabled);
++        if enabled {
++            return Ok(());
++        }
++        return Err(zbus::fdo::Error::AccessDenied(
++            "Clipboard not enabled".into(),
++        ));
++    }
++    Err(zbus::fdo::Error::InvalidArgs(
++        "Unknown clipboard session".into(),
++    ))
++}
++
++fn mime_types(options: &HashMap<String, OwnedValue>) -> Vec<String> {
++    let Some(value) = options.get("mime_types") else {
++        return Vec::new();
++    };
++    match value.downcast_ref::<&zvariant::Array>() {
++        Ok(array) => array
++            .iter()
++            .filter_map(|item| item.downcast_ref::<&str>().ok().map(str::to_owned))
++            .collect(),
++        Err(err) => {
++            tracing::warn!("clipboard mime_types has an unexpected type: {err}");
++            Vec::new()
++        }
++    }
++}
++
++async fn forward_event(connection: &zbus::Connection, event: ClipEvent) -> zbus::Result<()> {
++    match event {
++        ClipEvent::Owner {
++            sessions,
++            mimes,
++            owner,
++        } => {
++            for session in sessions {
++                let is_owner = owner.as_deref() == Some(session.as_str());
++                emit_owner(connection, &session, &mimes, is_owner).await?;
++            }
++            Ok(())
++        }
++        ClipEvent::Transfer {
++            session,
++            mime,
++            serial,
++        } => emit_transfer(connection, &session, &mime, serial).await,
++    }
++}
++
++async fn emit_owner(
++    connection: &zbus::Connection,
++    session: &str,
++    mimes: &[String],
++    session_is_owner: bool,
++) -> zbus::Result<()> {
++    let iface = connection
++        .object_server()
++        .interface::<_, Clipboard>(DBUS_PATH)
++        .await?;
++    let path = object_path(session)?;
++    let mime_types = zvariant::Value::Array(zvariant::Array::from(mimes.to_vec()))
++        .try_to_owned()
++        .map_err(|err| zbus::Error::Failure(err.to_string()))?;
++    let options = HashMap::from([
++        ("mime_types".to_string(), mime_types),
++        (
++            "session_is_owner".to_string(),
++            OwnedValue::from(session_is_owner),
++        ),
++    ]);
++    Clipboard::selection_owner_changed(iface.signal_emitter(), &path, options).await
++}
++
++async fn emit_transfer(
++    connection: &zbus::Connection,
++    session: &str,
++    mime: &str,
++    serial: u32,
++) -> zbus::Result<()> {
++    let iface = connection
++        .object_server()
++        .interface::<_, Clipboard>(DBUS_PATH)
++        .await?;
++    let path = object_path(session)?;
++    Clipboard::selection_transfer(iface.signal_emitter(), &path, mime, serial).await
++}
++
++fn object_path(session: &str) -> zbus::Result<zvariant::OwnedObjectPath> {
++    zvariant::ObjectPath::try_from(session)
++        .map(zvariant::OwnedObjectPath::from)
++        .map_err(|err| zbus::Error::Failure(err.to_string()))
++}
++
++fn thread_main(
++    cmd_rx: Receiver<Cmd>,
++    wake_read: OwnedFd,
++    event_tx: tokio::sync::mpsc::UnboundedSender<ClipEvent>,
++    available: Arc<AtomicBool>,
++) {
++    if let Err(err) = run(&cmd_rx, &wake_read, event_tx, &available) {
++        tracing::warn!("clipboard data-control unavailable: {err:#}");
++        available.store(false, Ordering::Release);
++    }
++    while let Ok(cmd) = cmd_rx.recv() {
++        fail_cmd(cmd);
++    }
++}
++
++fn fail_cmd(cmd: Cmd) {
++    match cmd {
++        Cmd::SetSelection { reply, .. } => {
++            let _ = reply.send(Err("ext-data-control is not available".into()));
++        }
++        Cmd::Read { reply, .. } | Cmd::Write { reply, .. } => {
++            let _ = reply.send(Err("ext-data-control is not available".into()));
++        }
++        Cmd::Snapshot { reply } => {
++            let _ = reply.send(Snapshot {
++                mimes: Vec::new(),
++                owner: None,
++            });
++        }
++        Cmd::Grant { .. } | Cmd::DropSession { .. } | Cmd::WriteDone { .. } => {}
++    }
++}
++
++struct Offer {
++    offer: ExtDataControlOfferV1,
++    mimes: Vec<String>,
++}
++
++struct ClipState {
++    // Keeps the seat binding alive for the data device.
++    _seat: Option<WlSeat>,
++    manager: Option<ExtDataControlManagerV1>,
++    device: Option<ExtDataControlDeviceV1>,
++    pending: Vec<Offer>,
++    current: Option<Offer>,
++    primary: Option<ExtDataControlOfferV1>,
++    source: Option<ExtDataControlSourceV1>,
++    owner: Option<String>,
++    sessions: Vec<String>,
++    writes: HashMap<u32, OwnedFd>,
++    next_serial: u32,
++    events: tokio::sync::mpsc::UnboundedSender<ClipEvent>,
++    available: Arc<AtomicBool>,
++}
++
++impl ClipState {
++    fn publish(&self) {
++        if self.sessions.is_empty() {
++            return;
++        }
++        let mimes = self
++            .current
++            .as_ref()
++            .map(|offer| offer.mimes.clone())
++            .unwrap_or_default();
++        let _ = self.events.send(ClipEvent::Owner {
++            sessions: self.sessions.clone(),
++            mimes,
++            owner: self.owner.clone(),
++        });
++    }
++}
++
++fn take_pending(state: &mut ClipState, offer: ExtDataControlOfferV1) -> Offer {
++    if let Some(index) = state
++        .pending
++        .iter()
++        .position(|item| item.offer.id() == offer.id())
++    {
++        state.pending.remove(index)
++    } else {
++        Offer {
++            offer,
++            mimes: Vec::new(),
++        }
++    }
++}
++
++fn run(
++    cmd_rx: &Receiver<Cmd>,
++    wake_read: &OwnedFd,
++    event_tx: tokio::sync::mpsc::UnboundedSender<ClipEvent>,
++    available: &Arc<AtomicBool>,
++) -> anyhow::Result<()> {
++    let conn = Connection::connect_to_env().map_err(|err| anyhow::anyhow!("wayland: {err}"))?;
++    let (globals, mut queue) =
++        registry_queue_init(&conn).map_err(|err| anyhow::anyhow!("wayland globals: {err}"))?;
++    let qh = queue.handle();
++    let seat: WlSeat = globals
++        .bind(&qh, 1..=8, ())
++        .map_err(|err| anyhow::anyhow!("wl_seat: {err}"))?;
++    let manager: ExtDataControlManagerV1 = globals
++        .bind(&qh, 1..=1, ())
++        .map_err(|err| anyhow::anyhow!("ext_data_control_manager_v1: {err}"))?;
++    let device = manager.get_data_device(&seat, &qh, ());
++    let mut state = ClipState {
++        _seat: Some(seat),
++        manager: Some(manager),
++        device: Some(device),
++        pending: Vec::new(),
++        current: None,
++        primary: None,
++        source: None,
++        owner: None,
++        sessions: Vec::new(),
++        writes: HashMap::new(),
++        next_serial: 1,
++        events: event_tx,
++        available: available.clone(),
++    };
++    queue
++        .roundtrip(&mut state)
++        .map_err(|err| anyhow::anyhow!("clipboard roundtrip: {err}"))?;
++    available.store(true, Ordering::Release);
++    let mime_count = state.current.as_ref().map(|offer| offer.mimes.len()).unwrap_or(0);
++    tracing::warn!("Clipboard ext-data-control ready ({mime_count} mime types)");
++
++    loop {
++        dispatch_once(&mut queue, &mut state)?;
++        while let Ok(cmd) = cmd_rx.try_recv() {
++            handle(&mut state, &qh, &queue, cmd);
++        }
++        queue.flush()?;
++        let Some(guard) = conn.prepare_read() else {
++            continue;
++        };
++        if let Ok(cmd) = cmd_rx.try_recv() {
++            drop(guard);
++            handle(&mut state, &qh, &queue, cmd);
++            while let Ok(cmd) = cmd_rx.try_recv() {
++                handle(&mut state, &qh, &queue, cmd);
++            }
++            continue;
++        }
++        let polled = {
++            let wl = guard.connection_fd();
++            let mut fds = [
++                rustix::event::PollFd::new(&wl, rustix::event::PollFlags::IN),
++                rustix::event::PollFd::new(wake_read, rustix::event::PollFlags::IN),
++            ];
++            match rustix::event::poll(&mut fds, None) {
++                Ok(_) => Ok((fds[0].revents(), fds[1].revents())),
++                Err(err) => Err(err),
++            }
++        };
++        let (wl_events, wake_events) = match polled {
++            Err(rustix::io::Errno::INTR) => {
++                drop(guard);
++                continue;
++            }
++            Err(err) => return Err(err.into()),
++            Ok(events) => events,
++        };
++        let wayland_ready = wl_events.intersects(
++            rustix::event::PollFlags::IN
++                | rustix::event::PollFlags::ERR
++                | rustix::event::PollFlags::HUP,
++        );
++        if wayland_ready {
++            if let Err(err) = guard.read() {
++                return Err(err.into());
++            }
++        } else {
++            drop(guard);
++        }
++        if wake_events.intersects(rustix::event::PollFlags::IN) {
++            drain(wake_read.as_fd());
++        }
++    }
++}
++
++fn dispatch_once(queue: &mut EventQueue<ClipState>, state: &mut ClipState) -> anyhow::Result<()> {
++    match queue.dispatch_pending(state) {
++        Ok(_) => Ok(()),
++        Err(err @ DispatchError::BadMessage { .. }) => {
++            tracing::warn!("clipboard dispatch: {err}");
++            Ok(())
++        }
++        Err(err) => Err(err.into()),
++    }
++}
++
++fn drain(fd: BorrowedFd<'_>) {
++    let mut buf = [0u8; 32];
++    loop {
++        match rustix::io::read(fd, &mut buf) {
++            Ok(0) => break,
++            Ok(_) => continue,
++            Err(rustix::io::Errno::INTR) => continue,
++            Err(_) => break,
++        }
++    }
++}
++
++fn handle(state: &mut ClipState, qh: &QueueHandle<ClipState>, queue: &EventQueue<ClipState>, cmd: Cmd) {
++    match cmd {
++        Cmd::Grant { path } => {
++            if !state.sessions.iter().any(|session| session == &path) {
++                state.sessions.push(path);
++            }
++        }
++        Cmd::DropSession { path } => {
++            state.sessions.retain(|session| session != &path);
++            if state.owner.as_deref() == Some(path.as_str()) {
++                clear_selection(state, queue);
++            }
++        }
++        Cmd::SetSelection {
++            session,
++            mimes,
++            reply,
++        } => {
++            let _ = reply.send(set_selection(state, qh, queue, session, mimes));
++        }
++        Cmd::Read { mime, reply } => {
++            let _ = reply.send(selection_read(state, queue, mime));
++        }
++        Cmd::Write { serial, reply } => {
++            let result = match state.writes.get(&serial) {
++                Some(fd) => rustix::io::dup(fd.as_fd()).map_err(|err| err.to_string()),
++                None => Err(format!("unknown selection transfer {serial}")),
++            };
++            let _ = reply.send(result);
++        }
++        Cmd::WriteDone { serial } => {
++            state.writes.remove(&serial);
++        }
++        Cmd::Snapshot { reply } => {
++            let mimes = state
++                .current
++                .as_ref()
++                .map(|offer| offer.mimes.clone())
++                .unwrap_or_default();
++            let _ = reply.send(Snapshot {
++                mimes,
++                owner: state.owner.clone(),
++            });
++        }
++    }
++}
++
++fn clear_selection(state: &mut ClipState, queue: &EventQueue<ClipState>) {
++    if let Some(device) = state.device.clone() {
++        device.set_selection(None);
++        let _ = queue.flush();
++    }
++    state.source = None;
++    state.owner = None;
++    state.publish();
++}
++
++fn set_selection(
++    state: &mut ClipState,
++    qh: &QueueHandle<ClipState>,
++    queue: &EventQueue<ClipState>,
++    session: String,
++    mimes: Vec<String>,
++) -> Result<(), String> {
++    let Some(manager) = state.manager.clone() else {
++        return Err("ext-data-control is not available".into());
++    };
++    let Some(device) = state.device.clone() else {
++        return Err("ext-data-control is not available".into());
++    };
++    if mimes.is_empty() {
++        device.set_selection(None);
++        state.source = None;
++        state.owner = None;
++        queue.flush().map_err(|err| err.to_string())?;
++        state.publish();
++        return Ok(());
++    }
++    let source = manager.create_data_source(qh, ());
++    for mime in &mimes {
++        source.offer(mime.clone());
++    }
++    device.set_selection(Some(&source));
++    let _old = state.source.take();
++    state.source = Some(source);
++    state.owner = Some(session);
++    queue.flush().map_err(|err| err.to_string())?;
++    Ok(())
++}
++
++fn selection_read(
++    state: &mut ClipState,
++    queue: &EventQueue<ClipState>,
++    mime: String,
++) -> Result<OwnedFd, String> {
++    let Some(current) = state.current.as_ref() else {
++        return Err("no current clipboard selection".into());
++    };
++    if !current.mimes.iter().any(|offered| offered == &mime) {
++        return Err(format!("mime type {mime} is not offered"));
++    }
++    let offer = current.offer.clone();
++    let (read_fd, write_fd) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
++        .map_err(|err| err.to_string())?;
++    offer.receive(mime, write_fd.as_fd());
++    queue.flush().map_err(|err| err.to_string())?;
++    drop(write_fd);
++    Ok(read_fd)
++}
++
++impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for ClipState {
++    fn event(
++        _: &mut Self,
++        _: &wl_registry::WlRegistry,
++        _: wl_registry::Event,
++        _: &GlobalListContents,
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++    }
++}
++
++impl Dispatch<WlSeat, ()> for ClipState {
++    fn event(
++        _: &mut Self,
++        _: &WlSeat,
++        _: wayland_client::protocol::wl_seat::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++    }
++}
++
++impl Dispatch<ExtDataControlManagerV1, ()> for ClipState {
++    fn event(
++        _: &mut Self,
++        _: &ExtDataControlManagerV1,
++        _: wayland_protocols::ext::data_control::v1::client::ext_data_control_manager_v1::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++    }
++}
++
++impl Dispatch<ExtDataControlDeviceV1, ()> for ClipState {
++    fn event(
++        state: &mut Self,
++        _: &ExtDataControlDeviceV1,
++        event: ext_data_control_device_v1::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        match event {
++            ext_data_control_device_v1::Event::DataOffer { id } => {
++                state.pending.push(Offer {
++                    offer: id,
++                    mimes: Vec::new(),
++                });
++            }
++            ext_data_control_device_v1::Event::Selection { id } => {
++                if let Some(old) = state.current.take() {
++                    old.offer.destroy();
++                }
++                state.current = id.map(|offer| take_pending(state, offer));
++                state.publish();
++            }
++            ext_data_control_device_v1::Event::PrimarySelection { id } => {
++                if let Some(old) = state.primary.take() {
++                    old.destroy();
++                }
++                if let Some(offer) = id {
++                    let taken = take_pending(state, offer);
++                    state.primary = Some(taken.offer);
++                }
++            }
++            ext_data_control_device_v1::Event::Finished => {
++                state.available.store(false, Ordering::Release);
++            }
++            _ => {}
++        }
++    }
++
++    event_created_child!(ClipState, ExtDataControlDeviceV1, [
++        ext_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, ()),
++    ]);
++}
++
++impl Dispatch<ExtDataControlOfferV1, ()> for ClipState {
++    fn event(
++        state: &mut Self,
++        proxy: &ExtDataControlOfferV1,
++        event: ext_data_control_offer_v1::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        let ext_data_control_offer_v1::Event::Offer { mime_type } = event else {
++            return;
++        };
++        if let Some(offer) = state
++            .pending
++            .iter_mut()
++            .find(|item| item.offer.id() == proxy.id())
++        {
++            if !offer.mimes.iter().any(|mime| mime == &mime_type) {
++                offer.mimes.push(mime_type);
++            }
++        }
++    }
++}
++
++impl Dispatch<ExtDataControlSourceV1, ()> for ClipState {
++    fn event(
++        state: &mut Self,
++        proxy: &ExtDataControlSourceV1,
++        event: ext_data_control_source_v1::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        match event {
++            ext_data_control_source_v1::Event::Send { mime_type, fd } => {
++                let Some(session) = state.owner.clone() else {
++                    return;
++                };
++                let serial = state.next_serial;
++                state.next_serial = state.next_serial.wrapping_add(1);
++                state.writes.insert(serial, fd);
++                let _ = state.events.send(ClipEvent::Transfer {
++                    session,
++                    mime: mime_type,
++                    serial,
++                });
++            }
++            ext_data_control_source_v1::Event::Cancelled => {
++                if state.source.as_ref().is_some_and(|source| source.id() == proxy.id()) {
++                    state.source = None;
++                    state.owner = None;
++                    state.publish();
++                }
++            }
++            _ => {}
++        }
++    }
++}
+diff --git a/src/input_capture.rs b/src/input_capture.rs
+new file mode 100644
+index 0000000..301a8bc
+--- /dev/null
++++ b/src/input_capture.rs
+@@ -0,0 +1,1097 @@
++//! Implementation of the XDG InputCapture portal.
++//!
++//! COSMIC's compositor owns the physical input stream and the pointer-barrier
++//! state. This portal interface handles the public protocol, permission UI,
++//! and forwards the EIS file descriptor to the compositor through its private
++//! session-bus interface.
++
++use std::collections::HashMap;
++use std::os::unix::fs::MetadataExt;
++use std::path::{Path, PathBuf};
++use std::sync::{Arc, Mutex};
++
++use futures::StreamExt;
++use tokio::sync::mpsc::Sender;
++use zbus::message::Header;
++use zbus::object_server::SignalEmitter;
++use zbus::zvariant::{self, OwnedValue};
++
++use crate::screencast::RestoreData;
++use crate::{DBUS_PATH, PortalResponse, Request, Session, access, subscription};
++
++pub(crate) const DEVICE_KEYBOARD: u32 = 1;
++pub(crate) const DEVICE_POINTER: u32 = 2;
++const SUPPORTED_DEVICE_TYPES: u32 = DEVICE_KEYBOARD | DEVICE_POINTER;
++const MAX_BARRIERS: usize = 256;
++type Zone = (u32, u32, i32, i32);
++
++fn release_owned_session(owner: &Mutex<Option<String>>, handle: &str) {
++    let mut current = owner.lock().unwrap();
++    if current.as_deref() == Some(handle) {
++        *current = None;
++    }
++}
++
++#[derive(Debug, zvariant::DeserializeDict, zvariant::Type)]
++#[zvariant(signature = "dict")]
++struct Barrier {
++    barrier_id: u32,
++    position: (i32, i32, i32, i32),
++}
++
++#[derive(Debug, zvariant::SerializeDict, zvariant::Type)]
++#[zvariant(signature = "a{sv}")]
++struct ZonesResult {
++    zones: Vec<Zone>,
++    zone_set: u32,
++}
++
++#[derive(Debug, zvariant::SerializeDict, zvariant::Type)]
++#[zvariant(signature = "a{sv}")]
++struct SetPointerBarriersResult {
++    failed_barriers: Vec<u32>,
++}
++
++#[derive(Debug, zvariant::SerializeDict, zvariant::Type)]
++#[zvariant(signature = "a{sv}")]
++struct StartResult {
++    capabilities: u32,
++    clipboard_enabled: bool,
++    restore_data: Option<RestoreData>,
++}
++
++#[derive(Debug, zvariant::DeserializeDict, zvariant::Type)]
++#[zvariant(signature = "a{sv}")]
++struct StartOptions {
++    capabilities: u32,
++    restore_data: Option<RestoreData>,
++    persist_mode: Option<u32>,
++}
++
++/// Private restore payload. The public restore blob is never sufficient on its
++/// own: PermissionStore must still contain a grant for this application.
++fn restore_matches(data: &RestoreData, app_id: &str, capabilities: u32) -> bool {
++    let Some(payload) = data.cosmic_v1_data() else {
++        return false;
++    };
++    let Ok(structure) = zvariant::Structure::try_from(&**payload) else {
++        return false;
++    };
++    let Ok((stored_app, stored_capabilities)): Result<(String, u32), _> = structure.try_into()
++    else {
++        return false;
++    };
++    stored_app == app_id && stored_capabilities == capabilities
++}
++
++fn restore_data(app_id: &str, capabilities: u32) -> RestoreData {
++    RestoreData::cosmic_v1(zvariant::Structure::from((app_id, capabilities)))
++}
++
++/// The portal-side state associated with one InputCapture session.
++pub(crate) struct InputCaptureData {
++    connection: zbus::Connection,
++    session_handle: zvariant::OwnedObjectPath,
++    pub(crate) device_types: u32,
++    pub(crate) started: bool,
++    pub(crate) clipboard_requested: bool,
++    connected: bool,
++    session_owner: Arc<Mutex<Option<String>>>,
++}
++
++impl InputCaptureData {
++    fn new(
++        connection: zbus::Connection,
++        session_handle: zvariant::OwnedObjectPath,
++        session_owner: Arc<Mutex<Option<String>>>,
++    ) -> Self {
++        Self {
++            connection,
++            session_handle,
++            device_types: 0,
++            started: false,
++            clipboard_requested: false,
++            connected: false,
++            session_owner,
++        }
++    }
++
++    fn close(&mut self) {
++        crate::clipboard::session_closed(self.session_handle.as_str());
++        let connection = self.connection.clone();
++        let session_handle = self.session_handle.to_string();
++        let session_owner = self.session_owner.clone();
++        tokio::spawn(async move {
++            if let Ok(proxy) = CosmicCompInputCaptureProxy::new(&connection).await {
++                let _ = proxy.close(&session_handle).await;
++            }
++            release_owned_session(&session_owner, &session_handle);
++        });
++    }
++}
++
++#[derive(Clone, Debug)]
++pub(crate) enum CompSignal {
++    Activated {
++        session_handle: String,
++        activation_id: u32,
++        barrier_id: u32,
++        cursor_position: (f64, f64),
++    },
++    Deactivated {
++        session_handle: String,
++        activation_id: u32,
++        cursor_position: (f64, f64),
++    },
++    Disabled {
++        session_handle: String,
++    },
++    ZonesChanged {
++        session_handle: String,
++        zone_set: u32,
++    },
++}
++
++#[zbus::proxy(
++    interface = "com.system76.CosmicComp.InputCapture",
++    default_service = "com.system76.CosmicComp",
++    default_path = "/com/system76/CosmicComp/InputCapture"
++)]
++trait CosmicCompInputCapture {
++    fn get_receiver_socket(
++        &self,
++        session_handle: &str,
++        device_types: u32,
++    ) -> zbus::Result<zvariant::OwnedFd>;
++
++    fn get_zones(&self, session_handle: &str) -> zbus::Result<(u32, Vec<Zone>)>;
++
++    fn set_pointer_barriers(
++        &self,
++        session_handle: &str,
++        zone_set: u32,
++        barriers: Vec<(u32, (i32, i32, i32, i32))>,
++    ) -> zbus::Result<Vec<u32>>;
++
++    fn enable(&self, session_handle: &str) -> zbus::Result<()>;
++    fn disable(&self, session_handle: &str) -> zbus::Result<()>;
++    fn release(
++        &self,
++        session_handle: &str,
++        activation_id: zvariant::Optional<u32>,
++        cursor_position: zvariant::Optional<(f64, f64)>,
++    ) -> zbus::Result<()>;
++    fn close(&self, session_handle: &str) -> zbus::Result<()>;
++
++    #[zbus(signal)]
++    fn activated(
++        &self,
++        session_handle: &str,
++        activation_id: u32,
++        barrier_id: u32,
++        cursor_position: (f64, f64),
++    ) -> zbus::Result<()>;
++
++    #[zbus(signal)]
++    fn deactivated(
++        &self,
++        session_handle: &str,
++        activation_id: u32,
++        cursor_position: (f64, f64),
++    ) -> zbus::Result<()>;
++
++    #[zbus(signal)]
++    fn disabled(&self, session_handle: &str) -> zbus::Result<()>;
++
++    #[zbus(signal)]
++    fn zones_changed(&self, session_handle: &str, zone_set: u32) -> zbus::Result<()>;
++}
++
++#[zbus::proxy(
++    interface = "org.freedesktop.impl.portal.PermissionStore",
++    default_service = "org.freedesktop.impl.portal.PermissionStore",
++    default_path = "/org/freedesktop/impl/portal/PermissionStore"
++)]
++trait PermissionStore {
++    fn get_permission(&self, table: &str, id: &str, app: &str) -> zbus::Result<Vec<String>>;
++
++    fn set_permission(
++        &self,
++        table: &str,
++        create: bool,
++        id: &str,
++        app: &str,
++        permissions: Vec<String>,
++    ) -> zbus::Result<()>;
++}
++
++pub struct InputCapture {
++    tx: Sender<subscription::Event>,
++    session_owner: Arc<Mutex<Option<String>>>,
++}
++
++impl InputCapture {
++    pub fn new(tx: Sender<subscription::Event>) -> Self {
++        Self {
++            tx,
++            session_owner: Arc::new(Mutex::new(None)),
++        }
++    }
++
++    fn claim_session(&self, session_handle: &zvariant::ObjectPath<'_>) -> bool {
++        let mut owner = self.session_owner.lock().unwrap();
++        if owner.is_some() {
++            return false;
++        }
++        *owner = Some(session_handle.to_string());
++        true
++    }
++
++    async fn install_session(
++        &self,
++        connection: &zbus::Connection,
++        session_handle: &zvariant::ObjectPath<'_>,
++    ) -> zbus::Result<()> {
++        connection
++            .object_server()
++            .at(
++                session_handle,
++                Session::new(
++                    InputCaptureData::new(
++                        connection.clone(),
++                        session_handle.to_owned().into(),
++                        self.session_owner.clone(),
++                    ),
++                    |data| data.close(),
++                ),
++            )
++            .await?;
++        Ok(())
++    }
++
++    async fn session_data(
++        connection: &zbus::Connection,
++        session_handle: &zvariant::ObjectPath<'_>,
++    ) -> Option<zbus::object_server::InterfaceRef<Session<InputCaptureData>>> {
++        crate::session_interface(connection, session_handle).await
++    }
++}
++
++fn option_u32(options: &HashMap<String, OwnedValue>, key: &str) -> Option<u32> {
++    options
++        .get(key)
++        .and_then(|value| value.downcast_ref::<u32>().ok())
++}
++
++fn option_pair(options: &HashMap<String, OwnedValue>, key: &str) -> Option<(f64, f64)> {
++    options
++        .get(key)
++        .and_then(|value| value.downcast_ref::<(f64, f64)>().ok())
++}
++
++fn requested_capabilities(options: &HashMap<String, OwnedValue>) -> Option<u32> {
++    let requested = option_u32(options, "capabilities")? & SUPPORTED_DEVICE_TYPES;
++    (requested != 0).then_some(requested)
++}
++
++fn capabilities_result(capabilities: u32) -> HashMap<String, OwnedValue> {
++    HashMap::from([("capabilities".to_string(), OwnedValue::from(capabilities))])
++}
++
++const PERMISSION_TABLE: &str = "input-capture";
++const PERMISSION_ID: &str = "keyboard-and-pointer";
++
++/// XDG's native (unsandboxed) clients have an empty app ID. Never use that
++/// empty value as a persistent permission key: it is shared by every native
++/// client. The frontend's session path includes the actual caller's unique
++/// bus name, which we resolve to a system-owned executable for this case.
++struct ConsentIdentity {
++    key: Option<String>,
++    label: String,
++}
++
++fn native_sender_from_session_path(path: &str) -> Option<String> {
++    let suffix = path.strip_prefix("/org/freedesktop/portal/desktop/session/")?;
++    let (sender, token) = suffix.split_once('/')?;
++    if sender.is_empty() || token.is_empty() {
++        return None;
++    }
++    let name = format!(":{}", sender.replace('_', "."));
++    zbus::names::BusName::try_from(name.as_str()).ok()?;
++    Some(name)
++}
++
++fn system_owned_executable(path: &Path) -> Option<PathBuf> {
++    let canonical = path.canonicalize().ok()?;
++    let mut part = Some(canonical.as_path());
++    while let Some(path) = part {
++        let metadata = std::fs::metadata(path).ok()?;
++        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
++            return None;
++        }
++        part = path.parent();
++    }
++    Some(canonical)
++}
++
++fn offer_persistent_choice(requested_mode: Option<u32>, identity: &ConsentIdentity) -> bool {
++    requested_mode == Some(2)
++        || (requested_mode.is_none()
++            && identity
++                .key
++                .as_deref()
++                .is_some_and(|key| key.starts_with("native-exe:")))
++}
++
++async fn consent_identity(
++    connection: &zbus::Connection,
++    session_handle: &zvariant::ObjectPath<'_>,
++    app_id: &str,
++) -> ConsentIdentity {
++    if !app_id.is_empty() {
++        return ConsentIdentity {
++            key: Some(app_id.to_string()),
++            label: app_id.to_string(),
++        };
++    }
++    let native = async {
++        let sender = native_sender_from_session_path(session_handle.as_str())?;
++        let bus_name = zbus::names::BusName::try_from(sender.as_str()).ok()?;
++        let bus = zbus::fdo::DBusProxy::new(connection).await.ok()?;
++        let pid = bus.get_connection_unix_process_id(bus_name).await.ok()?;
++        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
++        system_owned_executable(&exe)
++    }
++    .await;
++    match native {
++        Some(exe) => {
++            let label = exe.to_string_lossy().into_owned();
++            ConsentIdentity {
++                key: Some(format!("native-exe:{label}")),
++                label,
++            }
++        }
++        None => ConsentIdentity {
++            key: None,
++            label: crate::fl!("unknown-application"),
++        },
++    }
++}
++
++/// The implementation interface is a private backend API. Checking only the
++/// app ID or session path is insufficient because direct callers can forge
++/// both. The XDG portal frontend is the sole allowed caller.
++pub(crate) async fn called_by_portal_frontend(
++    connection: &zbus::Connection,
++    header: &Header<'_>,
++) -> bool {
++    let Some(sender) = header.sender() else {
++        return false;
++    };
++    let Ok(bus) = zbus::fdo::DBusProxy::new(connection).await else {
++        return false;
++    };
++    let name =
++        zbus::names::WellKnownName::from_static_str_unchecked("org.freedesktop.portal.Desktop");
++    bus.get_name_owner(zbus::names::BusName::WellKnown(name))
++        .await
++        .is_ok_and(|owner| owner.as_str() == sender.as_str())
++}
++
++async fn always_allowed(connection: &zbus::Connection, app_id: &str) -> bool {
++    let Ok(proxy) = PermissionStoreProxy::new(connection).await else {
++        tracing::debug!("PermissionStore is unavailable; asking for InputCapture consent");
++        return false;
++    };
++    match proxy
++        .get_permission(PERMISSION_TABLE, PERMISSION_ID, app_id)
++        .await
++    {
++        Ok(permissions) => permissions.iter().any(|permission| permission == "yes"),
++        Err(err) => {
++            tracing::debug!("No persistent InputCapture permission for {app_id}: {err}");
++            false
++        }
++    }
++}
++
++async fn remember_always_allowed(connection: &zbus::Connection, app_id: &str) {
++    let Ok(proxy) = PermissionStoreProxy::new(connection).await else {
++        tracing::warn!("PermissionStore is unavailable; cannot remember InputCapture consent");
++        return;
++    };
++    if let Err(err) = proxy
++        .set_permission(
++            PERMISSION_TABLE,
++            true,
++            PERMISSION_ID,
++            app_id,
++            vec!["yes".to_string()],
++        )
++        .await
++    {
++        tracing::warn!("Failed to persist InputCapture consent for {app_id}: {err}");
++    }
++}
++
++async fn permission_prompt(
++    connection: &zbus::Connection,
++    tx: &Sender<subscription::Event>,
++    handle: &zvariant::ObjectPath<'_>,
++    identity: &ConsentIdentity,
++    parent_window: &str,
++    allow_always: bool,
++) -> access::ConfirmationResult {
++    if let Some(key) = identity.key.as_deref()
++        && always_allowed(connection, key).await
++    {
++        return access::ConfirmationResult::Allow;
++    }
++
++    access::show_confirmation(
++        tx,
++        handle.to_owned(),
++        &identity.label,
++        parent_window,
++        access::ConfirmationLabels {
++            title: crate::fl!("input-capture"),
++            subtitle: crate::fl!("input-capture-request"),
++            body: crate::fl!(
++                "input-capture-description",
++                app_name = identity.label.as_str()
++            ),
++            grant: crate::fl!("allow"),
++            deny: crate::fl!("deny"),
++            icon: "input-mouse-symbolic".to_string(),
++            always_allow: allow_always && identity.key.is_some(),
++        },
++    )
++    .await
++}
++
++#[allow(unused_variables)]
++#[zbus::interface(name = "org.freedesktop.impl.portal.InputCapture")]
++impl InputCapture {
++    #[allow(clippy::too_many_arguments)] // Fixed backend D-Bus signature plus caller authorization.
++    async fn create_session(
++        &self,
++        #[zbus(connection)] connection: &zbus::Connection,
++        #[zbus(header)] header: Header<'_>,
++        handle: zvariant::ObjectPath<'_>,
++        session_handle: zvariant::ObjectPath<'_>,
++        app_id: String,
++        parent_window: String,
++        options: HashMap<String, OwnedValue>,
++    ) -> PortalResponse<HashMap<String, OwnedValue>> {
++        if !called_by_portal_frontend(connection, &header).await {
++            return PortalResponse::Other;
++        }
++        let Some(requested) = requested_capabilities(&options) else {
++            return PortalResponse::Other;
++        };
++        let identity = consent_identity(connection, &session_handle, &app_id).await;
++        if self
++            .install_session(connection, &session_handle)
++            .await
++            .is_err()
++        {
++            return PortalResponse::Other;
++        }
++        let prompt_handle = handle.to_owned();
++        Request::run(connection, &handle, || async {}, async {
++            let decision = permission_prompt(
++                connection,
++                &self.tx,
++                &prompt_handle,
++                &identity,
++                &parent_window,
++                true,
++            )
++            .await;
++            if decision == access::ConfirmationResult::Deny {
++                return PortalResponse::Cancelled;
++            }
++            let Some(interface) = Self::session_data(connection, &session_handle).await else {
++                return PortalResponse::Other;
++            };
++            if !self.claim_session(&session_handle) {
++                tracing::warn!("An InputCapture session already owns the seat");
++                return PortalResponse::Other;
++            }
++            let mut data = interface.get_mut().await;
++            data.device_types = requested;
++            data.started = true;
++            drop(data);
++            if decision == access::ConfirmationResult::AlwaysAllow
++                && let Some(key) = identity.key.as_deref()
++            {
++                remember_always_allowed(connection, key).await;
++            }
++            PortalResponse::Success(capabilities_result(requested))
++        })
++        .await
++    }
++
++    async fn create_session2(
++        &self,
++        #[zbus(connection)] connection: &zbus::Connection,
++        #[zbus(header)] header: Header<'_>,
++        session_handle: zvariant::ObjectPath<'_>,
++        app_id: String,
++        options: HashMap<String, OwnedValue>,
++    ) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
++        if !called_by_portal_frontend(connection, &header).await {
++            return Err(zbus::fdo::Error::AccessDenied(
++                "InputCapture frontend required".into(),
++            ));
++        }
++        self.install_session(connection, &session_handle).await?;
++        Ok(HashMap::new())
++    }
++
++    #[allow(clippy::too_many_arguments)] // Fixed backend D-Bus signature plus caller authorization.
++    async fn start(
++        &self,
++        #[zbus(connection)] connection: &zbus::Connection,
++        #[zbus(header)] header: Header<'_>,
++        handle: zvariant::ObjectPath<'_>,
++        session_handle: zvariant::ObjectPath<'_>,
++        app_id: String,
++        parent_window: String,
++        options: StartOptions,
++    ) -> PortalResponse<StartResult> {
++        if !called_by_portal_frontend(connection, &header).await {
++            return PortalResponse::Other;
++        }
++        let requested = options.capabilities & SUPPORTED_DEVICE_TYPES;
++        if requested == 0 {
++            return PortalResponse::Other;
++        }
++        let persist_mode = options.persist_mode.unwrap_or(0);
++        if persist_mode > 2 {
++            return PortalResponse::Other;
++        }
++        let identity = consent_identity(connection, &session_handle, &app_id).await;
++        let allow_always = offer_persistent_choice(options.persist_mode, &identity);
++        let prompt_handle = handle.to_owned();
++        Request::run(connection, &handle, || async {}, async {
++            let Some(interface) = Self::session_data(connection, &session_handle).await else {
++                return PortalResponse::Other;
++            };
++            if interface.get().await.started {
++                return PortalResponse::Other;
++            }
++            let restored = if let Some(key) = identity.key.as_deref() {
++                options
++                    .restore_data
++                    .as_ref()
++                    .is_some_and(|data| restore_matches(data, key, requested))
++                    && always_allowed(connection, key).await
++            } else {
++                false
++            };
++            let decision = if restored {
++                access::ConfirmationResult::Allow
++            } else {
++                permission_prompt(
++                    connection,
++                    &self.tx,
++                    &prompt_handle,
++                    &identity,
++                    &parent_window,
++                    allow_always,
++                )
++                .await
++            };
++            if decision == access::ConfirmationResult::Deny {
++                return PortalResponse::Cancelled;
++            }
++            if !self.claim_session(&session_handle) {
++                tracing::warn!("An InputCapture session already owns the seat");
++                return PortalResponse::Other;
++            }
++            let mut data = interface.get_mut().await;
++            data.device_types = requested;
++            data.started = true;
++            let clipboard_enabled = data.clipboard_requested && crate::clipboard::is_available();
++            drop(data);
++            if clipboard_enabled {
++                crate::clipboard::schedule_announce(connection.clone(), session_handle.to_string());
++            }
++            if decision == access::ConfirmationResult::AlwaysAllow
++                && let Some(key) = identity.key.as_deref()
++            {
++                remember_always_allowed(connection, key).await;
++            }
++            let persist_key = if persist_mode == 2 {
++                identity.key.as_deref()
++            } else {
++                None
++            };
++            let restore_data = if let Some(key) = persist_key
++                && always_allowed(connection, key).await
++            {
++                Some(restore_data(key, requested))
++            } else {
++                None
++            };
++            PortalResponse::Success(StartResult {
++                capabilities: requested,
++                clipboard_enabled,
++                restore_data,
++            })
++        })
++        .await
++    }
++
++    async fn get_zones(
++        &self,
++        #[zbus(connection)] connection: &zbus::Connection,
++        #[zbus(header)] header: Header<'_>,
++        handle: zvariant::ObjectPath<'_>,
++        session_handle: zvariant::ObjectPath<'_>,
++        app_id: String,
++        options: HashMap<String, OwnedValue>,
++    ) -> PortalResponse<ZonesResult> {
++        if !called_by_portal_frontend(connection, &header).await {
++            return PortalResponse::Other;
++        }
++        Request::run(connection, &handle, || async {}, async {
++            let Some(interface) = Self::session_data(connection, &session_handle).await else {
++                return PortalResponse::Other;
++            };
++            let data = interface.get().await;
++            // libportal's legacy CreateSession() helper retrieves the zones
++            // before it calls ConnectToEIS().  The portal session must only
++            // have been started at this point; requiring an EIS connection
++            // here makes the legacy API fail with "GetZones() failed".
++            if !data.started {
++                return PortalResponse::Other;
++            }
++            let Ok(proxy) = CosmicCompInputCaptureProxy::new(connection).await else {
++                return PortalResponse::Other;
++            };
++            let Ok((zone_set, zones)) = proxy.get_zones(session_handle.as_str()).await else {
++                return PortalResponse::Other;
++            };
++            PortalResponse::Success(ZonesResult { zones, zone_set })
++        })
++        .await
++    }
++
++    #[allow(clippy::too_many_arguments)] // Public D-Bus signature is fixed by the portal specification.
++    async fn set_pointer_barriers(
++        &self,
++        #[zbus(connection)] connection: &zbus::Connection,
++        #[zbus(header)] header: Header<'_>,
++        handle: zvariant::ObjectPath<'_>,
++        session_handle: zvariant::ObjectPath<'_>,
++        app_id: String,
++        options: HashMap<String, OwnedValue>,
++        barriers: Vec<Barrier>,
++        zone_set: u32,
++    ) -> PortalResponse<SetPointerBarriersResult> {
++        if !called_by_portal_frontend(connection, &header).await {
++            return PortalResponse::Other;
++        }
++        if barriers.len() > MAX_BARRIERS {
++            return PortalResponse::Other;
++        }
++        Request::run(connection, &handle, || async {}, async {
++            let Some(interface) = Self::session_data(connection, &session_handle).await else {
++                return PortalResponse::Other;
++            };
++            let data = interface.get().await;
++            if !data.started || !data.connected {
++                return PortalResponse::Other;
++            }
++            let Ok(proxy) = CosmicCompInputCaptureProxy::new(connection).await else {
++                return PortalResponse::Other;
++            };
++            let barriers = barriers
++                .into_iter()
++                .map(|barrier| (barrier.barrier_id, barrier.position))
++                .collect();
++            let Ok(failed_barriers) = proxy
++                .set_pointer_barriers(session_handle.as_str(), zone_set, barriers)
++                .await
++            else {
++                return PortalResponse::Other;
++            };
++            PortalResponse::Success(SetPointerBarriersResult { failed_barriers })
++        })
++        .await
++    }
++
++    async fn enable(
++        &self,
++        #[zbus(connection)] connection: &zbus::Connection,
++        #[zbus(header)] header: Header<'_>,
++        session_handle: zvariant::ObjectPath<'_>,
++        app_id: String,
++        options: HashMap<String, OwnedValue>,
++    ) -> PortalResponse<HashMap<String, OwnedValue>> {
++        if !called_by_portal_frontend(connection, &header).await {
++            return PortalResponse::Other;
++        }
++        let Some(interface) = Self::session_data(connection, &session_handle).await else {
++            return PortalResponse::Other;
++        };
++        let data = interface.get().await;
++        if !data.started || !data.connected {
++            return PortalResponse::Other;
++        }
++        let Ok(proxy) = CosmicCompInputCaptureProxy::new(connection).await else {
++            return PortalResponse::Other;
++        };
++        match proxy.enable(session_handle.as_str()).await {
++            Ok(()) => {
++                if interface.get().await.clipboard_requested {
++                    crate::clipboard::announce(connection, session_handle.as_str()).await;
++                }
++                PortalResponse::Success(HashMap::new())
++            }
++            Err(err) => {
++                tracing::debug!("Failed to enable InputCapture: {err}");
++                PortalResponse::Other
++            }
++        }
++    }
++
++    async fn disable(
++        &self,
++        #[zbus(connection)] connection: &zbus::Connection,
++        #[zbus(header)] header: Header<'_>,
++        session_handle: zvariant::ObjectPath<'_>,
++        app_id: String,
++        options: HashMap<String, OwnedValue>,
++    ) -> PortalResponse<HashMap<String, OwnedValue>> {
++        if !called_by_portal_frontend(connection, &header).await {
++            return PortalResponse::Other;
++        }
++        let Some(interface) = Self::session_data(connection, &session_handle).await else {
++            return PortalResponse::Other;
++        };
++        if !interface.get().await.started {
++            return PortalResponse::Other;
++        }
++        let Ok(proxy) = CosmicCompInputCaptureProxy::new(connection).await else {
++            return PortalResponse::Other;
++        };
++        match proxy.disable(session_handle.as_str()).await {
++            Ok(()) => PortalResponse::Success(HashMap::new()),
++            Err(err) => {
++                tracing::debug!("Failed to disable InputCapture: {err}");
++                PortalResponse::Other
++            }
++        }
++    }
++
++    async fn release(
++        &self,
++        #[zbus(connection)] connection: &zbus::Connection,
++        #[zbus(header)] header: Header<'_>,
++        session_handle: zvariant::ObjectPath<'_>,
++        app_id: String,
++        options: HashMap<String, OwnedValue>,
++    ) -> PortalResponse<HashMap<String, OwnedValue>> {
++        if !called_by_portal_frontend(connection, &header).await {
++            return PortalResponse::Other;
++        }
++        let Some(interface) = Self::session_data(connection, &session_handle).await else {
++            return PortalResponse::Other;
++        };
++        if !interface.get().await.started {
++            return PortalResponse::Other;
++        }
++        let Ok(proxy) = CosmicCompInputCaptureProxy::new(connection).await else {
++            return PortalResponse::Other;
++        };
++        match proxy
++            .release(
++                session_handle.as_str(),
++                zvariant::Optional::from(option_u32(&options, "activation_id")),
++                zvariant::Optional::from(option_pair(&options, "cursor_position")),
++            )
++            .await
++        {
++            Ok(()) => PortalResponse::Success(HashMap::new()),
++            Err(err) => {
++                tracing::debug!("Failed to release InputCapture: {err}");
++                PortalResponse::Other
++            }
++        }
++    }
++
++    #[zbus(name = "ConnectToEIS")]
++    async fn connect_to_eis(
++        &self,
++        #[zbus(connection)] connection: &zbus::Connection,
++        #[zbus(header)] header: Header<'_>,
++        session_handle: zvariant::ObjectPath<'_>,
++        app_id: String,
++        options: HashMap<String, OwnedValue>,
++    ) -> zbus::fdo::Result<zvariant::OwnedFd> {
++        if !called_by_portal_frontend(connection, &header).await {
++            return Err(zbus::fdo::Error::AccessDenied(
++                "InputCapture frontend required".into(),
++            ));
++        }
++        let Some(interface) = Self::session_data(connection, &session_handle).await else {
++            return Err(zbus::fdo::Error::InvalidArgs(
++                "Unknown InputCapture session".to_string(),
++            ));
++        };
++        let mut data = interface.get_mut().await;
++        if !data.started || data.connected {
++            return Err(zbus::fdo::Error::InvalidArgs(
++                "InputCapture session is not connectable".to_string(),
++            ));
++        }
++        let proxy = CosmicCompInputCaptureProxy::new(connection)
++            .await
++            .map_err(|err| zbus::fdo::Error::Failed(err.to_string()))?;
++        let fd = proxy
++            .get_receiver_socket(session_handle.as_str(), data.device_types)
++            .await
++            .map_err(|err| zbus::fdo::Error::Failed(err.to_string()))?;
++        data.connected = true;
++        Ok(fd)
++    }
++
++    #[zbus(property, name = "SupportedCapabilities")]
++    async fn supported_capabilities(&self) -> u32 {
++        SUPPORTED_DEVICE_TYPES
++    }
++
++    #[zbus(property, name = "version")]
++    async fn version(&self) -> u32 {
++        2
++    }
++
++    #[zbus(signal)]
++    async fn activated(
++        emitter: &SignalEmitter<'_>,
++        session_handle: &zvariant::ObjectPath<'_>,
++        options: HashMap<String, OwnedValue>,
++    ) -> zbus::Result<()>;
++
++    #[zbus(signal)]
++    async fn deactivated(
++        emitter: &SignalEmitter<'_>,
++        session_handle: &zvariant::ObjectPath<'_>,
++        options: HashMap<String, OwnedValue>,
++    ) -> zbus::Result<()>;
++
++    #[zbus(signal)]
++    async fn disabled(
++        emitter: &SignalEmitter<'_>,
++        session_handle: &zvariant::ObjectPath<'_>,
++        options: HashMap<String, OwnedValue>,
++    ) -> zbus::Result<()>;
++
++    #[zbus(signal)]
++    async fn zones_changed(
++        emitter: &SignalEmitter<'_>,
++        session_handle: &zvariant::ObjectPath<'_>,
++        options: HashMap<String, OwnedValue>,
++    ) -> zbus::Result<()>;
++}
++
++/// Forward a compositor signal to the public portal interface.
++pub(crate) async fn forward_signal(
++    connection: &zbus::Connection,
++    signal: CompSignal,
++) -> zbus::Result<()> {
++    let iface = connection
++        .object_server()
++        .interface::<_, InputCapture>(DBUS_PATH)
++        .await?;
++    let emitter = iface.signal_emitter();
++    match signal {
++        CompSignal::Activated {
++            session_handle,
++            activation_id,
++            barrier_id,
++            cursor_position,
++        } => {
++            let session_handle = zvariant::ObjectPath::try_from(session_handle.as_str())
++                .map_err(|err| zbus::Error::Failure(err.to_string()))?;
++            let options = HashMap::from([
++                ("activation_id".to_string(), OwnedValue::from(activation_id)),
++                ("barrier_id".to_string(), OwnedValue::from(barrier_id)),
++                (
++                    "cursor_position".to_string(),
++                    zvariant::Value::from((cursor_position.0, cursor_position.1))
++                        .try_to_owned()
++                        .map_err(|err| zbus::Error::Failure(err.to_string()))?,
++                ),
++            ]);
++            InputCapture::activated(emitter, &session_handle, options).await
++        }
++        CompSignal::Deactivated {
++            session_handle,
++            activation_id,
++            cursor_position,
++        } => {
++            let session_handle = zvariant::ObjectPath::try_from(session_handle.as_str())
++                .map_err(|err| zbus::Error::Failure(err.to_string()))?;
++            let options = HashMap::from([
++                ("activation_id".to_string(), OwnedValue::from(activation_id)),
++                (
++                    "cursor_position".to_string(),
++                    zvariant::Value::from((cursor_position.0, cursor_position.1))
++                        .try_to_owned()
++                        .map_err(|err| zbus::Error::Failure(err.to_string()))?,
++                ),
++            ]);
++            InputCapture::deactivated(emitter, &session_handle, options).await
++        }
++        CompSignal::Disabled { session_handle } => {
++            let session_handle = zvariant::ObjectPath::try_from(session_handle.as_str())
++                .map_err(|err| zbus::Error::Failure(err.to_string()))?;
++            InputCapture::disabled(emitter, &session_handle, HashMap::new()).await
++        }
++        CompSignal::ZonesChanged {
++            session_handle,
++            zone_set,
++        } => {
++            let session_handle = zvariant::ObjectPath::try_from(session_handle.as_str())
++                .map_err(|err| zbus::Error::Failure(err.to_string()))?;
++            let options = HashMap::from([("zone_set".to_string(), OwnedValue::from(zone_set))]);
++            InputCapture::zones_changed(emitter, &session_handle, options).await
++        }
++    }
++}
++
++/// Listen to the compositor's private signal stream. The public portal
++/// dispatcher consumes the resulting events and emits the standard signals.
++pub(crate) async fn watch_compositor(
++    connection: zbus::Connection,
++    tx: Sender<subscription::Event>,
++) -> zbus::Result<()> {
++    let proxy = CosmicCompInputCaptureProxy::new(&connection).await?;
++    let mut activated = proxy.receive_activated().await?;
++    let mut deactivated = proxy.receive_deactivated().await?;
++    let mut disabled = proxy.receive_disabled().await?;
++    let mut zones_changed = proxy.receive_zones_changed().await?;
++    loop {
++        tokio::select! {
++            signal = activated.next() => {
++                let Some(signal) = signal else { return Ok(()); };
++                let args = signal.args()?;
++                tx.send(subscription::Event::InputCapture(CompSignal::Activated {
++                    session_handle: args.session_handle.to_string(),
++                    activation_id: args.activation_id,
++                    barrier_id: args.barrier_id,
++                    cursor_position: args.cursor_position,
++                })).await.map_err(|err| zbus::Error::Failure(err.to_string()))?;
++            }
++            signal = deactivated.next() => {
++                let Some(signal) = signal else { return Ok(()); };
++                let args = signal.args()?;
++                tx.send(subscription::Event::InputCapture(CompSignal::Deactivated {
++                    session_handle: args.session_handle.to_string(),
++                    activation_id: args.activation_id,
++                    cursor_position: args.cursor_position,
++                })).await.map_err(|err| zbus::Error::Failure(err.to_string()))?;
++            }
++            signal = disabled.next() => {
++                let Some(signal) = signal else { return Ok(()); };
++                let args = signal.args()?;
++                tx.send(subscription::Event::InputCapture(CompSignal::Disabled {
++                    session_handle: args.session_handle.to_string(),
++                })).await.map_err(|err| zbus::Error::Failure(err.to_string()))?;
++            }
++            signal = zones_changed.next() => {
++                let Some(signal) = signal else { return Ok(()); };
++                let args = signal.args()?;
++                tx.send(subscription::Event::InputCapture(CompSignal::ZonesChanged {
++                    session_handle: args.session_handle.to_string(),
++                    zone_set: args.zone_set,
++                })).await.map_err(|err| zbus::Error::Failure(err.to_string()))?;
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn restore_data_must_match_application_and_capabilities() {
++        let data = restore_data("org.example.Synergy", DEVICE_KEYBOARD | DEVICE_POINTER);
++        assert!(restore_matches(
++            &data,
++            "org.example.Synergy",
++            DEVICE_KEYBOARD | DEVICE_POINTER
++        ));
++        assert!(!restore_matches(
++            &data,
++            "org.example.Other",
++            DEVICE_KEYBOARD | DEVICE_POINTER
++        ));
++        assert!(!restore_matches(
++            &data,
++            "org.example.Synergy",
++            DEVICE_POINTER
++        ));
++    }
++
++    #[test]
++    fn unsupported_or_empty_capabilities_are_rejected() {
++        assert_eq!(requested_capabilities(&HashMap::new()), None);
++        let options = HashMap::from([("capabilities".to_string(), OwnedValue::from(4_u32))]);
++        assert_eq!(requested_capabilities(&options), None);
++    }
++
++    #[test]
++    fn one_seat_owner_and_close_only_releases_its_own_session() {
++        let (tx, _) = tokio::sync::mpsc::channel(1);
++        let portal = InputCapture::new(tx);
++        let first = zvariant::ObjectPath::try_from("/session/first").unwrap();
++        let second = zvariant::ObjectPath::try_from("/session/second").unwrap();
++        assert!(portal.claim_session(&first));
++        assert!(!portal.claim_session(&second));
++        release_owned_session(&portal.session_owner, second.as_str());
++        assert!(!portal.claim_session(&second));
++        release_owned_session(&portal.session_owner, first.as_str());
++        assert!(portal.claim_session(&second));
++    }
++
++    #[test]
++    fn native_consent_uses_frontend_session_sender_not_empty_app_id() {
++        assert_eq!(
++            native_sender_from_session_path(
++                "/org/freedesktop/portal/desktop/session/1_30615/portal372470189"
++            ),
++            Some(":1.30615".to_string())
++        );
++        assert_eq!(
++            native_sender_from_session_path("/other/session/1_30615/token"),
++            None
++        );
++        assert_eq!(
++            native_sender_from_session_path("/org/freedesktop/portal/desktop/session//token"),
++            None
++        );
++    }
++
++    #[test]
++    fn persistent_native_consent_rejects_writable_executable_locations() {
++        assert!(system_owned_executable(Path::new("/usr/bin/true")).is_some());
++        assert!(system_owned_executable(&std::env::temp_dir()).is_none());
++    }
++
++    #[test]
++    fn legacy_native_client_can_explicitly_choose_persistent_consent() {
++        let identity = ConsentIdentity {
++            key: Some("native-exe:/opt/Synergy/synergy-core".into()),
++            label: "Synergy".into(),
++        };
++        assert!(offer_persistent_choice(None, &identity));
++        assert!(!offer_persistent_choice(Some(0), &identity));
++        assert!(offer_persistent_choice(Some(2), &identity));
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index cb146e3..51e3d5d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -13,8 +13,10 @@ pub use cosmic_portal_config as config;
+ mod access;
+ mod app;
+ mod buffer;
++mod clipboard;
+ mod documents;
+ mod file_chooser;
++mod input_capture;
+ mod localize;
+ mod remote_desktop;
+ mod remote_desktop_dialog;
+@@ -335,6 +337,14 @@ impl Settings {
+ }
+ 
+ fn main() -> cosmic::iced::Result {
++    // reis exposes an opt-in raw EIS wire dump through REIS_DEBUG. This
++    // process handles input events, so never allow an inherited environment
++    // variable to enable that dump. main is still single-threaded here,
++    // which satisfies remove_var's safety requirement.
++    unsafe {
++        std::env::remove_var("REIS_DEBUG");
++    }
++
+     let trace = tracing_subscriber::registry();
+     let env_filter = EnvFilter::builder()
+         .with_default_directive(LevelFilter::WARN.into())
+diff --git a/src/remote_desktop.rs b/src/remote_desktop.rs
+index 82633e2..0f7935f 100644
+--- a/src/remote_desktop.rs
++++ b/src/remote_desktop.rs
+@@ -25,6 +25,7 @@ pub(crate) const PERSIST_UNTIL_REVOKED: u32 = 2;
+ pub(crate) struct RemoteDesktopData {
+     pub(crate) device_types: u32,
+     pub(crate) clipboard_enabled: bool,
++    pub(crate) clipboard_session: Option<String>,
+     pub(crate) persist_mode: u32,
+     pub(crate) granted_persist_mode: u32,
+     pub(crate) screen_cast_enabled: bool,
+@@ -38,6 +39,7 @@ impl Default for RemoteDesktopData {
+         Self {
+             device_types: ALL_DEVICE_TYPES,
+             clipboard_enabled: false,
++            clipboard_session: None,
+             persist_mode: PERSIST_NONE,
+             granted_persist_mode: PERSIST_NONE,
+             screen_cast_enabled: false,
+@@ -407,6 +409,9 @@ impl RemoteDesktop {
+                 remote_desktop.stream_offsets = stream_offsets;
+             }
+ 
++            if clipboard_enabled {
++                crate::clipboard::schedule_announce(connection.clone(), session_handle.to_string());
++            }
+             PortalResponse::Success(StartResult {
+                 devices: device_types,
+                 clipboard_enabled,
+diff --git a/src/screencast.rs b/src/screencast.rs
+index 01c730b..a00c243 100644
+--- a/src/screencast.rs
++++ b/src/screencast.rs
+@@ -182,6 +182,13 @@ impl SessionData {
+         for thread in mem::take(&mut self.screencast_threads) {
+             thread.stop();
+         }
++        if let Some(path) = self
++            .remote_desktop
++            .as_ref()
++            .and_then(|remote| remote.clipboard_session.clone())
++        {
++            crate::clipboard::session_closed(&path);
++        }
+         self.closed = true
+     }
+ }
+diff --git a/src/subscription.rs b/src/subscription.rs
+index c6c4b6a..c5d57f4 100644
+--- a/src/subscription.rs
++++ b/src/subscription.rs
+@@ -2,6 +2,7 @@
+ 
+ use std::any::TypeId;
+ use std::hash::Hash;
++use std::time::Duration;
+ 
+ use cosmic::cosmic_theme::palette::Srgba;
+ use cosmic::iced::Subscription;
+@@ -28,6 +29,7 @@ pub enum Event {
+     CancelScreencast(zvariant::ObjectPath<'static>),
+     RemoteDesktop(crate::remote_desktop_dialog::Args),
+     CancelRemoteDesktop(zvariant::ObjectPath<'static>),
++    InputCapture(crate::input_capture::CompSignal),
+     Accent(Srgba),
+     IsDark(bool),
+     HighContrast(bool),
+@@ -90,6 +92,7 @@ pub(crate) async fn process_changes(
+         State::Init => {
+             let (tx, rx) = tokio::sync::mpsc::channel(10);
+ 
++            crate::clipboard::start();
+             let connection = zbus::connection::Builder::session()?
+                 .serve_at(DBUS_PATH, Access::new(wayland_helper.clone(), tx.clone()))?
+                 .serve_at(DBUS_PATH, FileChooser::new(tx.clone()))?
+@@ -105,9 +108,43 @@ pub(crate) async fn process_changes(
+                     DBUS_PATH,
+                     ScreenCast::new(wayland_helper.clone(), tx.clone()),
+                 )?
++                .serve_at(
++                    DBUS_PATH,
++                    crate::input_capture::InputCapture::new(tx.clone()),
++                )?
++                .serve_at(DBUS_PATH, crate::clipboard::Clipboard::new())?
+                 .serve_at(DBUS_PATH, Settings::new())?
+                 .build()
+                 .await?;
++            crate::clipboard::spawn_forwarder(connection.clone());
++
++            let compositor_connection = connection.clone();
++            let compositor_tx = tx.clone();
++            tokio::spawn(async move {
++                loop {
++                    if compositor_tx.is_closed() {
++                        break;
++                    }
++                    match crate::input_capture::watch_compositor(
++                        compositor_connection.clone(),
++                        compositor_tx.clone(),
++                    )
++                    .await
++                    {
++                        Ok(()) => {
++                            tracing::debug!(
++                                "InputCapture compositor signal watcher ended; retrying"
++                            );
++                        }
++                        Err(err) => {
++                            tracing::debug!(
++                                "InputCapture compositor signal watcher unavailable: {err}"
++                            );
++                        }
++                    }
++                    tokio::time::sleep(Duration::from_secs(1)).await;
++                }
++            });
+ 
+             // Create name lost stream before requesting name
+             let dbus = fdo::DBusProxy::new(&connection).await?;
+@@ -159,6 +196,9 @@ pub(crate) async fn process_changes(
+                             tracing::error!("Error sending remote desktop cancel: {:?}", err);
+                         };
+                     }
++                    Event::InputCapture(signal) => {
++                        crate::input_capture::forward_signal(conn, signal).await?;
++                    }
+                     Event::Accent(a) => {
+                         let object_server = conn.object_server();
+                         let iface_ref = object_server.interface::<_, Settings>(DBUS_PATH).await?;
+-- 
+2.43.0
+

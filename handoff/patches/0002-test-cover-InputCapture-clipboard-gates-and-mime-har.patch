@@ -1,0 +1,318 @@
+From 1bd66145b433a7d2cd3657f9262b5c3c7bddb94c Mon Sep 17 00:00:00 2001
+From: Rob Bloodgood <rob@exitexchange.com>
+Date: Wed, 7 Oct 2026 10:45:23 -0700
+Subject: [portal-cosmic PATCH 2/2] test: cover InputCapture clipboard gates
+ and mime hardening
+
+Lock the Start clipboard_enabled contract Deskflow depends on, reject
+hostile mime offers, and document the automated + manual checklist.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ TESTING.md           |  17 ++++++
+ src/clipboard.rs     | 142 ++++++++++++++++++++++++++++++++++++++++---
+ src/input_capture.rs |  71 +++++++++++++++++++++-
+ 3 files changed, 222 insertions(+), 8 deletions(-)
+
+diff --git a/TESTING.md b/TESTING.md
+index c5b8bda..25c200e 100644
+--- a/TESTING.md
++++ b/TESTING.md
+@@ -2,6 +2,16 @@
+ 
+ This document provides a regression testing checklist for the COSMIC XDG desktop portal. The checklist provides a starting point for Quality Assurance reviews.
+ 
++## Automated
++
++```bash
++cargo test input_capture::tests clipboard::tests
++```
++
++InputCapture / Clipboard unit coverage lives in `src/input_capture.rs` and
++`src/clipboard.rs` (session ownership, Start `clipboard_enabled` gate, mime
++sanitization, restore-data shape).
++
+ ## Checklist
+ 
+ - [ ] Screenshots work
+@@ -13,3 +23,10 @@ This document provides a regression testing checklist for the COSMIC XDG desktop
+ - [ ] Webcam and screen sharing prompted through Firefox works
+ - [ ] The file chooser works from Firefox
+ - [ ] The file chooser, webcam, and screen share work from the Slack flatpak
++- [ ] InputCapture (Deskflow / Synergy)
++    - [ ] Consent prompt appears; persistent grant restores without re-prompt
++    - [ ] Pointer barriers activate / deactivate across machines
++    - [ ] After `RequestClipboard`, Start reports `clipboard_enabled: true`
++    - [ ] Ctrl+C / Ctrl+V text (and image where offered) transfers machine-to-machine
++    - [ ] Stopping Deskflow releases the seat so a second client can Start
++    - [ ] Middle-click / X11 PRIMARY is still *not* expected end-to-end (CLIPBOARD only)
+diff --git a/src/clipboard.rs b/src/clipboard.rs
+index 92673de..a3219d7 100644
+--- a/src/clipboard.rs
++++ b/src/clipboard.rs
+@@ -36,6 +36,48 @@ use crate::screencast::SessionData;
+ use crate::{DBUS_PATH, session_interface};
+ 
+ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
++/// Bound offer size so a hostile frontend cannot flood the Wayland queue.
++const MAX_MIME_TYPES: usize = 64;
++const MAX_MIME_LEN: usize = 255;
++
++/// `Start` reports clipboard only when the session asked and the backend is up.
++/// Deskflow keys off this flag before reading selection mime types.
++pub(crate) fn start_clipboard_enabled(clipboard_requested: bool, available: bool) -> bool {
++    clipboard_requested && available
++}
++
++/// Selection ops require both RequestClipboard and a successful Start.
++fn input_capture_clipboard_allowed(clipboard_requested: bool, started: bool) -> bool {
++    clipboard_requested && started
++}
++
++fn grant_session(sessions: &mut Vec<String>, path: String) {
++    if !sessions.iter().any(|session| session == &path) {
++        sessions.push(path);
++    }
++}
++
++/// Returns true when the dropped session owned the selection (clear it).
++fn drop_session(sessions: &mut Vec<String>, owner: &mut Option<String>, path: &str) -> bool {
++    sessions.retain(|session| session != path);
++    if owner.as_deref() == Some(path) {
++        *owner = None;
++        true
++    } else {
++        false
++    }
++}
++
++fn sanitize_mime(mime: &str) -> Option<String> {
++    if mime.is_empty() || mime.len() > MAX_MIME_LEN {
++        return None;
++    }
++    // Reject control bytes (including NUL) that break Wayland string offers.
++    if mime.bytes().any(|b| b < 0x20) {
++        return None;
++    }
++    Some(mime.to_owned())
++}
+ 
+ struct Snapshot {
+     mimes: Vec<String>,
+@@ -390,7 +432,7 @@ async fn require_enabled(
+     if let Some(interface) = session_interface::<InputCaptureData>(connection, session_handle).await
+     {
+         let data = interface.get().await;
+-        if data.clipboard_requested && data.started {
++        if input_capture_clipboard_allowed(data.clipboard_requested, data.started) {
+             return Ok(());
+         }
+         return Err(zbus::fdo::Error::AccessDenied(
+@@ -423,7 +465,8 @@ fn mime_types(options: &HashMap<String, OwnedValue>) -> Vec<String> {
+     match value.downcast_ref::<&zvariant::Array>() {
+         Ok(array) => array
+             .iter()
+-            .filter_map(|item| item.downcast_ref::<&str>().ok().map(str::to_owned))
++            .filter_map(|item| item.downcast_ref::<&str>().ok().and_then(sanitize_mime))
++            .take(MAX_MIME_TYPES)
+             .collect(),
+         Err(err) => {
+             tracing::warn!("clipboard mime_types has an unexpected type: {err}");
+@@ -704,13 +747,10 @@ fn drain(fd: BorrowedFd<'_>) {
+ fn handle(state: &mut ClipState, qh: &QueueHandle<ClipState>, queue: &EventQueue<ClipState>, cmd: Cmd) {
+     match cmd {
+         Cmd::Grant { path } => {
+-            if !state.sessions.iter().any(|session| session == &path) {
+-                state.sessions.push(path);
+-            }
++            grant_session(&mut state.sessions, path);
+         }
+         Cmd::DropSession { path } => {
+-            state.sessions.retain(|session| session != &path);
+-            if state.owner.as_deref() == Some(path.as_str()) {
++            if drop_session(&mut state.sessions, &mut state.owner, &path) {
+                 clear_selection(state, queue);
+             }
+         }
+@@ -949,3 +989,91 @@ impl Dispatch<ExtDataControlSourceV1, ()> for ClipState {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn mime_options(mimes: &[&str]) -> HashMap<String, OwnedValue> {
++        let array = zvariant::Array::from(
++            mimes
++                .iter()
++                .map(|mime| mime.to_string())
++                .collect::<Vec<_>>(),
++        );
++        HashMap::from([(
++            "mime_types".to_string(),
++            zvariant::Value::Array(array).try_to_owned().unwrap(),
++        )])
++    }
++
++    #[test]
++    fn start_clipboard_requires_request_and_live_backend() {
++        // Regression: Start used to hardcode clipboard_enabled: false, so Deskflow
++        // saw an empty selection and marshalled a 4-byte empty clipboard.
++        assert!(!start_clipboard_enabled(false, true));
++        assert!(!start_clipboard_enabled(true, false));
++        assert!(!start_clipboard_enabled(false, false));
++        assert!(start_clipboard_enabled(true, true));
++    }
++
++    #[test]
++    fn selection_ops_require_request_and_started_session() {
++        assert!(!input_capture_clipboard_allowed(false, true));
++        assert!(!input_capture_clipboard_allowed(true, false));
++        assert!(input_capture_clipboard_allowed(true, true));
++    }
++
++    #[test]
++    fn grant_session_is_idempotent_and_drop_clears_owner_only() {
++        let mut sessions = Vec::new();
++        let mut owner = Some("/session/a".into());
++        grant_session(&mut sessions, "/session/a".into());
++        grant_session(&mut sessions, "/session/a".into());
++        grant_session(&mut sessions, "/session/b".into());
++        assert_eq!(sessions, vec!["/session/a", "/session/b"]);
++
++        assert!(!drop_session(&mut sessions, &mut owner, "/session/b"));
++        assert_eq!(owner.as_deref(), Some("/session/a"));
++        assert!(drop_session(&mut sessions, &mut owner, "/session/a"));
++        assert!(owner.is_none());
++        assert!(sessions.is_empty());
++    }
++
++    #[test]
++    fn mime_types_parse_and_reject_hostile_input() {
++        assert!(mime_types(&HashMap::new()).is_empty());
++        assert_eq!(
++            mime_types(&mime_options(&["text/plain", "text/html"])),
++            vec!["text/plain", "text/html"]
++        );
++
++        let hostile = mime_options(&[
++            "",
++            "text/plain\0evil",
++            "ok/type",
++            &"x".repeat(MAX_MIME_LEN + 1),
++            "with\tcontrol",
++        ]);
++        assert_eq!(mime_types(&hostile), vec!["ok/type"]);
++
++        let many: Vec<String> = (0..MAX_MIME_TYPES + 8)
++            .map(|i| format!("application/x-test-{i}"))
++            .collect();
++        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
++        assert_eq!(mime_types(&mime_options(&refs)).len(), MAX_MIME_TYPES);
++    }
++
++    #[test]
++    fn object_path_rejects_invalid_session_handles() {
++        assert!(object_path("/org/freedesktop/portal/desktop/session/1_1/token").is_ok());
++        assert!(object_path("not-a-path").is_err());
++        assert!(object_path("/has space").is_err());
++        assert!(object_path("").is_err());
++    }
++
++    #[test]
++    fn clipboard_interface_version_is_v1() {
++        assert_eq!(Clipboard::new().version(), 1);
++    }
++}
+diff --git a/src/input_capture.rs b/src/input_capture.rs
+index 301a8bc..e3cb7c4 100644
+--- a/src/input_capture.rs
++++ b/src/input_capture.rs
+@@ -613,7 +613,10 @@ impl InputCapture {
+             let mut data = interface.get_mut().await;
+             data.device_types = requested;
+             data.started = true;
+-            let clipboard_enabled = data.clipboard_requested && crate::clipboard::is_available();
++            let clipboard_enabled = crate::clipboard::start_clipboard_enabled(
++                data.clipboard_requested,
++                crate::clipboard::is_available(),
++            );
+             drop(data);
+             if clipboard_enabled {
+                 crate::clipboard::schedule_announce(connection.clone(), session_handle.to_string());
+@@ -1094,4 +1097,70 @@ mod tests {
+         assert!(!offer_persistent_choice(Some(0), &identity));
+         assert!(offer_persistent_choice(Some(2), &identity));
+     }
++
++    #[test]
++    fn capabilities_mask_unsupported_bits_and_require_at_least_one() {
++        let ok = HashMap::from([(
++            "capabilities".to_string(),
++            OwnedValue::from(DEVICE_KEYBOARD | DEVICE_POINTER | 0b1000),
++        )]);
++        assert_eq!(
++            requested_capabilities(&ok),
++            Some(DEVICE_KEYBOARD | DEVICE_POINTER)
++        );
++        let only_unsupported = HashMap::from([("capabilities".to_string(), OwnedValue::from(8_u32))]);
++        assert_eq!(requested_capabilities(&only_unsupported), None);
++    }
++
++    #[test]
++    fn pointer_barrier_cap_matches_compositor_budget() {
++        // SetPointerBarriers returns PortalResponse::Other above this limit
++        // before any compositor round-trip (DoS / client bug guard).
++        assert_eq!(MAX_BARRIERS, 256);
++    }
++
++    #[test]
++    fn restore_payload_rejects_wrong_shape() {
++        let good = restore_data("org.deskflow.Deskflow", DEVICE_KEYBOARD | DEVICE_POINTER);
++        assert!(restore_matches(
++            &good,
++            "org.deskflow.Deskflow",
++            DEVICE_KEYBOARD | DEVICE_POINTER
++        ));
++        // Truncated cosmic_v1 payload must never unlock Start.
++        let truncated = RestoreData::cosmic_v1(zvariant::Structure::from((42u32,)));
++        assert!(!restore_matches(
++            &truncated,
++            "org.deskflow.Deskflow",
++            DEVICE_KEYBOARD | DEVICE_POINTER
++        ));
++    }
++
++    #[test]
++    fn session_owner_release_is_idempotent() {
++        let owner = Mutex::new(Some("/session/a".into()));
++        release_owned_session(&owner, "/session/b");
++        assert_eq!(owner.lock().unwrap().as_deref(), Some("/session/a"));
++        release_owned_session(&owner, "/session/a");
++        assert!(owner.lock().unwrap().is_none());
++        release_owned_session(&owner, "/session/a");
++        assert!(owner.lock().unwrap().is_none());
++    }
++
++    #[test]
++    fn native_session_path_fuzz_does_not_panic() {
++        let samples = [
++            "",
++            "/",
++            "/org/freedesktop/portal/desktop/session/",
++            "/org/freedesktop/portal/desktop/session/only",
++            "/org/freedesktop/portal/desktop/session/1_30615/",
++            "/org/freedesktop/portal/desktop/session/../evil/token",
++            "/org/freedesktop/portal/desktop/session/1_30615/portal372470189",
++            &"a".repeat(4096),
++        ];
++        for sample in samples {
++            let _ = native_sender_from_session_path(sample);
++        }
++    }
+ }
+-- 
+2.43.0
+
