@@ -613,7 +613,10 @@ impl InputCapture {
             let mut data = interface.get_mut().await;
             data.device_types = requested;
             data.started = true;
-            let clipboard_enabled = data.clipboard_requested && crate::clipboard::is_available();
+            let clipboard_enabled = crate::clipboard::start_clipboard_enabled(
+                data.clipboard_requested,
+                crate::clipboard::is_available(),
+            );
             drop(data);
             if clipboard_enabled {
                 crate::clipboard::schedule_announce(connection.clone(), session_handle.to_string());
@@ -1093,5 +1096,71 @@ mod tests {
         assert!(offer_persistent_choice(None, &identity));
         assert!(!offer_persistent_choice(Some(0), &identity));
         assert!(offer_persistent_choice(Some(2), &identity));
+    }
+
+    #[test]
+    fn capabilities_mask_unsupported_bits_and_require_at_least_one() {
+        let ok = HashMap::from([(
+            "capabilities".to_string(),
+            OwnedValue::from(DEVICE_KEYBOARD | DEVICE_POINTER | 0b1000),
+        )]);
+        assert_eq!(
+            requested_capabilities(&ok),
+            Some(DEVICE_KEYBOARD | DEVICE_POINTER)
+        );
+        let only_unsupported = HashMap::from([("capabilities".to_string(), OwnedValue::from(8_u32))]);
+        assert_eq!(requested_capabilities(&only_unsupported), None);
+    }
+
+    #[test]
+    fn pointer_barrier_cap_matches_compositor_budget() {
+        // SetPointerBarriers returns PortalResponse::Other above this limit
+        // before any compositor round-trip (DoS / client bug guard).
+        assert_eq!(MAX_BARRIERS, 256);
+    }
+
+    #[test]
+    fn restore_payload_rejects_wrong_shape() {
+        let good = restore_data("org.deskflow.Deskflow", DEVICE_KEYBOARD | DEVICE_POINTER);
+        assert!(restore_matches(
+            &good,
+            "org.deskflow.Deskflow",
+            DEVICE_KEYBOARD | DEVICE_POINTER
+        ));
+        // Truncated cosmic_v1 payload must never unlock Start.
+        let truncated = RestoreData::cosmic_v1(zvariant::Structure::from((42u32,)));
+        assert!(!restore_matches(
+            &truncated,
+            "org.deskflow.Deskflow",
+            DEVICE_KEYBOARD | DEVICE_POINTER
+        ));
+    }
+
+    #[test]
+    fn session_owner_release_is_idempotent() {
+        let owner = Mutex::new(Some("/session/a".into()));
+        release_owned_session(&owner, "/session/b");
+        assert_eq!(owner.lock().unwrap().as_deref(), Some("/session/a"));
+        release_owned_session(&owner, "/session/a");
+        assert!(owner.lock().unwrap().is_none());
+        release_owned_session(&owner, "/session/a");
+        assert!(owner.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn native_session_path_fuzz_does_not_panic() {
+        let samples = [
+            "",
+            "/",
+            "/org/freedesktop/portal/desktop/session/",
+            "/org/freedesktop/portal/desktop/session/only",
+            "/org/freedesktop/portal/desktop/session/1_30615/",
+            "/org/freedesktop/portal/desktop/session/../evil/token",
+            "/org/freedesktop/portal/desktop/session/1_30615/portal372470189",
+            &"a".repeat(4096),
+        ];
+        for sample in samples {
+            let _ = native_sender_from_session_path(sample);
+        }
     }
 }

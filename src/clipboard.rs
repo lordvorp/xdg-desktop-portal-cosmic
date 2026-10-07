@@ -36,6 +36,48 @@ use crate::screencast::SessionData;
 use crate::{DBUS_PATH, session_interface};
 
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bound offer size so a hostile frontend cannot flood the Wayland queue.
+const MAX_MIME_TYPES: usize = 64;
+const MAX_MIME_LEN: usize = 255;
+
+/// `Start` reports clipboard only when the session asked and the backend is up.
+/// Deskflow keys off this flag before reading selection mime types.
+pub(crate) fn start_clipboard_enabled(clipboard_requested: bool, available: bool) -> bool {
+    clipboard_requested && available
+}
+
+/// Selection ops require both RequestClipboard and a successful Start.
+fn input_capture_clipboard_allowed(clipboard_requested: bool, started: bool) -> bool {
+    clipboard_requested && started
+}
+
+fn grant_session(sessions: &mut Vec<String>, path: String) {
+    if !sessions.iter().any(|session| session == &path) {
+        sessions.push(path);
+    }
+}
+
+/// Returns true when the dropped session owned the selection (clear it).
+fn drop_session(sessions: &mut Vec<String>, owner: &mut Option<String>, path: &str) -> bool {
+    sessions.retain(|session| session != path);
+    if owner.as_deref() == Some(path) {
+        *owner = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn sanitize_mime(mime: &str) -> Option<String> {
+    if mime.is_empty() || mime.len() > MAX_MIME_LEN {
+        return None;
+    }
+    // Reject control bytes (including NUL) that break Wayland string offers.
+    if mime.bytes().any(|b| b < 0x20) {
+        return None;
+    }
+    Some(mime.to_owned())
+}
 
 struct Snapshot {
     mimes: Vec<String>,
@@ -390,7 +432,7 @@ async fn require_enabled(
     if let Some(interface) = session_interface::<InputCaptureData>(connection, session_handle).await
     {
         let data = interface.get().await;
-        if data.clipboard_requested && data.started {
+        if input_capture_clipboard_allowed(data.clipboard_requested, data.started) {
             return Ok(());
         }
         return Err(zbus::fdo::Error::AccessDenied(
@@ -423,7 +465,8 @@ fn mime_types(options: &HashMap<String, OwnedValue>) -> Vec<String> {
     match value.downcast_ref::<&zvariant::Array>() {
         Ok(array) => array
             .iter()
-            .filter_map(|item| item.downcast_ref::<&str>().ok().map(str::to_owned))
+            .filter_map(|item| item.downcast_ref::<&str>().ok().and_then(sanitize_mime))
+            .take(MAX_MIME_TYPES)
             .collect(),
         Err(err) => {
             tracing::warn!("clipboard mime_types has an unexpected type: {err}");
@@ -704,13 +747,10 @@ fn drain(fd: BorrowedFd<'_>) {
 fn handle(state: &mut ClipState, qh: &QueueHandle<ClipState>, queue: &EventQueue<ClipState>, cmd: Cmd) {
     match cmd {
         Cmd::Grant { path } => {
-            if !state.sessions.iter().any(|session| session == &path) {
-                state.sessions.push(path);
-            }
+            grant_session(&mut state.sessions, path);
         }
         Cmd::DropSession { path } => {
-            state.sessions.retain(|session| session != &path);
-            if state.owner.as_deref() == Some(path.as_str()) {
+            if drop_session(&mut state.sessions, &mut state.owner, &path) {
                 clear_selection(state, queue);
             }
         }
@@ -947,5 +987,93 @@ impl Dispatch<ExtDataControlSourceV1, ()> for ClipState {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mime_options(mimes: &[&str]) -> HashMap<String, OwnedValue> {
+        let array = zvariant::Array::from(
+            mimes
+                .iter()
+                .map(|mime| mime.to_string())
+                .collect::<Vec<_>>(),
+        );
+        HashMap::from([(
+            "mime_types".to_string(),
+            zvariant::Value::Array(array).try_to_owned().unwrap(),
+        )])
+    }
+
+    #[test]
+    fn start_clipboard_requires_request_and_live_backend() {
+        // Regression: Start used to hardcode clipboard_enabled: false, so Deskflow
+        // saw an empty selection and marshalled a 4-byte empty clipboard.
+        assert!(!start_clipboard_enabled(false, true));
+        assert!(!start_clipboard_enabled(true, false));
+        assert!(!start_clipboard_enabled(false, false));
+        assert!(start_clipboard_enabled(true, true));
+    }
+
+    #[test]
+    fn selection_ops_require_request_and_started_session() {
+        assert!(!input_capture_clipboard_allowed(false, true));
+        assert!(!input_capture_clipboard_allowed(true, false));
+        assert!(input_capture_clipboard_allowed(true, true));
+    }
+
+    #[test]
+    fn grant_session_is_idempotent_and_drop_clears_owner_only() {
+        let mut sessions = Vec::new();
+        let mut owner = Some("/session/a".into());
+        grant_session(&mut sessions, "/session/a".into());
+        grant_session(&mut sessions, "/session/a".into());
+        grant_session(&mut sessions, "/session/b".into());
+        assert_eq!(sessions, vec!["/session/a", "/session/b"]);
+
+        assert!(!drop_session(&mut sessions, &mut owner, "/session/b"));
+        assert_eq!(owner.as_deref(), Some("/session/a"));
+        assert!(drop_session(&mut sessions, &mut owner, "/session/a"));
+        assert!(owner.is_none());
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn mime_types_parse_and_reject_hostile_input() {
+        assert!(mime_types(&HashMap::new()).is_empty());
+        assert_eq!(
+            mime_types(&mime_options(&["text/plain", "text/html"])),
+            vec!["text/plain", "text/html"]
+        );
+
+        let hostile = mime_options(&[
+            "",
+            "text/plain\0evil",
+            "ok/type",
+            &"x".repeat(MAX_MIME_LEN + 1),
+            "with\tcontrol",
+        ]);
+        assert_eq!(mime_types(&hostile), vec!["ok/type"]);
+
+        let many: Vec<String> = (0..MAX_MIME_TYPES + 8)
+            .map(|i| format!("application/x-test-{i}"))
+            .collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(mime_types(&mime_options(&refs)).len(), MAX_MIME_TYPES);
+    }
+
+    #[test]
+    fn object_path_rejects_invalid_session_handles() {
+        assert!(object_path("/org/freedesktop/portal/desktop/session/1_1/token").is_ok());
+        assert!(object_path("not-a-path").is_err());
+        assert!(object_path("/has space").is_err());
+        assert!(object_path("").is_err());
+    }
+
+    #[test]
+    fn clipboard_interface_version_is_v1() {
+        assert_eq!(Clipboard::new().version(), 1);
     }
 }
