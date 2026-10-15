@@ -1,4 +1,8 @@
-See the Deskflow handoff document in the companion compositor tree:
+See the public index in the companion compositor tree:
+
+https://github.com/lordvorp/cosmic-comp/blob/inputcapture-on-41497b42/DOWNSTREAM.md
+
+Narrative handoff:
 
 https://github.com/lordvorp/cosmic-comp/blob/inputcapture-on-41497b42/HANDOFF.md
 
